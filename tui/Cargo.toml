@@ -1,0 +1,26 @@
+[package]
+name = "maraetai-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "maraetai"
+path = "src/main.rs"
+
+[dependencies]
+maraetai-common.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+zbus.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ratatui = "0.28"
+crossterm = "0.28"
+rpassword = "7"
+urlencoding = "2"
