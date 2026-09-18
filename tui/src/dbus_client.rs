@@ -8,28 +8,25 @@
 use zbus::Connection;
 use zbus::proxy;
 
+/// One queue entry: (stream_url, title, artist, album, art_url,
+/// duration_secs) — must match `daemon::control::QueueEntry` exactly.
+pub type QueueEntry = (String, String, String, String, String, f64);
+
 #[proxy(
     interface = "com.maraetai.Daemon1",
     default_service = "com.maraetai.Daemon",
     default_path = "/com/maraetai/Daemon"
 )]
 pub trait Control {
-    #[allow(clippy::too_many_arguments)]
-    async fn play_url(
-        &self,
-        stream_url: &str,
-        title: &str,
-        artist: &str,
-        album: &str,
-        art_url: &str,
-        duration_secs: f64,
-    ) -> zbus::Result<()>;
+    async fn play_queue(&self, tracks: Vec<QueueEntry>, start_index: u32) -> zbus::Result<()>;
+    async fn next(&self) -> zbus::Result<()>;
+    async fn previous(&self) -> zbus::Result<()>;
     async fn pause(&self) -> zbus::Result<()>;
     async fn resume(&self) -> zbus::Result<()>;
     async fn stop(&self) -> zbus::Result<()>;
     async fn seek_to(&self, position_secs: f64) -> zbus::Result<()>;
     async fn set_volume(&self, volume: f64) -> zbus::Result<()>;
-    async fn status(&self) -> zbus::Result<(String, String, f64)>;
+    async fn status(&self) -> zbus::Result<(String, String, f64, u32, u32)>;
     async fn quit(&self) -> zbus::Result<()>;
 }
 

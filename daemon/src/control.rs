@@ -1,9 +1,9 @@
 //! The daemon's own control interface (`com.maraetai.Daemon1`), for
-//! everything MPRIS doesn't cover: starting playback of a specific track
-//! (MPRIS has no "load and play this URL with this metadata" concept beyond
-//! the barely-standardized `OpenUri`), and explicit shutdown. Queue
-//! management (what's "next") intentionally isn't here yet — v1's TUI drives
-//! one track at a time; see the plan doc's Scope: OUT.
+//! everything MPRIS doesn't cover: loading a queue of tracks, and explicit
+//! shutdown. `Next`/`Previous` are *not* here — they're real MPRIS methods
+//! (see `mpris.rs`), since the queue lives in the daemon precisely so that
+//! MPRIS's Next/Previous (callable by hardware media keys, with no TUI
+//! involved) actually work.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,6 +12,12 @@ use tokio::sync::Notify;
 use zbus::interface;
 
 use crate::playback::{PlaybackHandle, Status, TrackMeta};
+
+/// One queue entry as it crosses D-Bus: (stream_url, title, artist, album,
+/// art_url, duration_secs). A plain tuple rather than a named struct because
+/// zbus/zvariant encode it identically either way (`a(sssssd)`), and a tuple
+/// needs no extra type wiring on either side of the connection.
+pub type QueueEntry = (String, String, String, String, String, f64);
 
 pub struct ControlInterface {
     playback: PlaybackHandle,
@@ -29,27 +35,38 @@ impl ControlInterface {
     }
 }
 
+fn to_track_meta(entry: QueueEntry) -> TrackMeta {
+    let (stream_url, title, artist, album, art_url, duration_secs) = entry;
+    TrackMeta {
+        stream_url,
+        title,
+        artist,
+        album,
+        art_url: (!art_url.is_empty()).then_some(art_url),
+        duration: (duration_secs > 0.0).then(|| Duration::from_secs_f64(duration_secs)),
+    }
+}
+
 #[interface(name = "com.maraetai.Daemon1")]
 impl ControlInterface {
-    /// Starts streaming and playing `stream_url` immediately. `art_url`/
-    /// `duration_secs` may be empty/zero if unknown.
-    async fn play_url(
-        &self,
-        stream_url: String,
-        title: String,
-        artist: String,
-        album: String,
-        art_url: String,
-        duration_secs: f64,
-    ) {
-        let meta = TrackMeta {
-            title,
-            artist,
-            album,
-            art_url: (!art_url.is_empty()).then_some(art_url),
-            duration: (duration_secs > 0.0).then(|| Duration::from_secs_f64(duration_secs)),
-        };
-        self.playback.play(stream_url, meta);
+    /// Replaces the queue and starts playing at `start_index` immediately.
+    /// A single-track "play just this" is simply a one-entry queue with
+    /// `start_index: 0`.
+    async fn play_queue(&self, tracks: Vec<QueueEntry>, start_index: u32) {
+        let tracks = tracks.into_iter().map(to_track_meta).collect();
+        self.playback.play_queue(tracks, start_index as usize);
+    }
+
+    /// Also exposed here (identical to MPRIS's own `Next`) purely so the TUI
+    /// only needs one D-Bus connection/proxy — real hardware media keys go
+    /// through the standard `org.mpris.MediaPlayer2.Player.Next` in
+    /// `mpris.rs`, which calls the exact same `PlaybackHandle::next()`.
+    async fn next(&self) {
+        self.playback.next();
+    }
+
+    async fn previous(&self) {
+        self.playback.previous();
     }
 
     async fn pause(&self) {
@@ -76,12 +93,13 @@ impl ControlInterface {
     }
 
     /// A compact status summary for `maraetai daemon status`: playback
-    /// status, current track title (empty if none), and position in
-    /// seconds. Kept as a plain method (not properties) since it's a
-    /// point-in-time snapshot read by a one-shot CLI command, not something a
-    /// D-Bus client watches for changes — that's what MPRIS's properties
-    /// (which do emit `PropertiesChanged`) are for.
-    async fn status(&self) -> (String, String, f64) {
+    /// status, current track title (empty if none), position in seconds,
+    /// and (queue index, queue length) for a "track 3 of 12" display. Kept
+    /// as a plain method (not properties) since it's a point-in-time
+    /// snapshot read by a one-shot CLI command, not something a D-Bus client
+    /// watches for changes — that's what MPRIS's properties (which do emit
+    /// `PropertiesChanged`) are for.
+    async fn status(&self) -> (String, String, f64, u32, u32) {
         let snap = self.playback.snapshot();
         let status = match snap.status {
             Status::Playing => "playing",
@@ -89,7 +107,13 @@ impl ControlInterface {
             Status::Stopped => "stopped",
         };
         let title = snap.track.map(|t| t.title).unwrap_or_default();
-        (status.to_string(), title, snap.position.as_secs_f64())
+        (
+            status.to_string(),
+            title,
+            snap.position.as_secs_f64(),
+            snap.queue_index as u32,
+            snap.queue_len as u32,
+        )
     }
 
     /// Begins graceful daemon shutdown — stops playback, releases both D-Bus

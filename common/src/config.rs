@@ -6,14 +6,30 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-/// On-disk config: server URL + username only. **Never the password** — that
-/// lives in the OS keyring (see [`Credentials::load`]), a deliberate
-/// improvement over every existing maraetai client, none of which use a
-/// hardware/OS-backed secret store on the platforms where one exists.
+/// The daemon shuts itself down after this long with nothing playing and no
+/// client activity, unless overridden by `Config::idle_timeout_secs` — see
+/// [`Config::idle_timeout`].
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 20 * 60;
+
+/// On-disk config: server URL + username, plus optional daemon tuning.
+/// **Never the password** — that lives in the OS keyring (see
+/// [`Credentials::load`]), a deliberate improvement over every existing
+/// maraetai client, none of which use a hardware/OS-backed secret store on
+/// the platforms where one exists.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Config {
     pub server_url: String,
     pub username: String,
+    /// Seconds of no playback + no client activity before the daemon exits
+    /// on its own. Absent/`None` means [`DEFAULT_IDLE_TIMEOUT_SECS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_secs: Option<u64>,
+}
+
+impl Config {
+    pub fn idle_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.idle_timeout_secs.unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS))
+    }
 }
 
 /// The OS keyring service name under which the password is stored, keyed by
@@ -109,11 +125,15 @@ impl Credentials {
     }
 
     /// Saves the config file and stores the password in the OS keyring. This
-    /// is the `maraetai login` flow.
+    /// is the `maraetai login` flow. Preserves `idle_timeout_secs` from an
+    /// existing config, if any, rather than resetting it — `login` changes
+    /// credentials, not daemon tuning a user may have already customized.
     pub fn save(server_url: String, username: String, password: &str) -> Result<()> {
+        let idle_timeout_secs = Config::load().ok().and_then(|c| c.idle_timeout_secs);
         Config {
             server_url,
             username: username.clone(),
+            idle_timeout_secs,
         }
         .save()?;
         keyring_entry(&username)?.set_password(password)?;
@@ -136,6 +156,7 @@ mod tests {
         let cfg = Config {
             server_url: "https://music.example.com".into(),
             username: "alice".into(),
+            idle_timeout_secs: Some(600),
         };
         cfg.save_to(&path).unwrap();
         let loaded = Config::load_from(&path).unwrap();
@@ -162,8 +183,39 @@ mod tests {
         let cfg = Config {
             server_url: "https://music.example.com".into(),
             username: "alice".into(),
+            idle_timeout_secs: None,
         };
         let raw = toml::to_string(&cfg).unwrap();
         assert!(!raw.contains("password"));
+    }
+
+    #[test]
+    fn idle_timeout_falls_back_to_default_when_unset() {
+        let cfg = Config {
+            server_url: "https://music.example.com".into(),
+            username: "alice".into(),
+            idle_timeout_secs: None,
+        };
+        assert_eq!(cfg.idle_timeout(), std::time::Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS));
+    }
+
+    #[test]
+    fn idle_timeout_uses_configured_value() {
+        let cfg = Config {
+            server_url: "https://music.example.com".into(),
+            username: "alice".into(),
+            idle_timeout_secs: Some(60),
+        };
+        assert_eq!(cfg.idle_timeout(), std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn absent_idle_timeout_field_deserializes_as_none() {
+        // A config file written before this field existed must still load.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "server_url = \"https://music.example.com\"\nusername = \"alice\"\n").unwrap();
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.idle_timeout_secs, None);
     }
 }

@@ -1,11 +1,17 @@
-//! The playback engine: a dedicated OS thread owning the audio output device
-//! and decode pipeline. It's a plain thread (not async) because `rodio`'s
-//! `OutputStream`/`Sink` wrap a `cpal` audio callback that must live on the
-//! thread that created it — bridging that into the daemon's async (tokio)
-//! world happens via two channels: a `Command` channel in, and either a
-//! shared `Snapshot` (for cheap, frequent reads like MPRIS's `Position`
-//! getter) or an `Event` channel out (for state transitions worth reacting
-//! to, like emitting an MPRIS `PropertiesChanged` signal).
+//! The playback engine: a dedicated OS thread owning the audio output device,
+//! decode pipeline, and the queue. It's a plain thread (not async) because
+//! `rodio`'s `OutputStream`/`Sink` wrap a `cpal` audio callback that must
+//! live on the thread that created it — bridging that into the daemon's
+//! async (tokio) world happens via two channels: a `Command` channel in, and
+//! either a shared `Snapshot` (for cheap, frequent reads like MPRIS's
+//! `Position` getter) or an `Event` channel out (for state transitions worth
+//! reacting to, like emitting an MPRIS `PropertiesChanged` signal).
+//!
+//! The queue lives here (in the daemon), not in the TUI, so that MPRIS's
+//! `Next`/`Previous` — which real hardware media keys and desktop widgets
+//! call directly over D-Bus, with no TUI involved at all — actually do
+//! something. A client-side-only queue would leave those buttons inert,
+//! which defeats a core point of building MPRIS support in the first place.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
@@ -23,6 +29,12 @@ use crate::range_reader::RangeReader;
 /// matter for CPU (this thread otherwise blocks entirely on `recv_timeout`).
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// A seek-to-current-track-restart (via `Previous`) counts as "already at the
+/// start" below this position — matches the common player convention of
+/// "previous" restarting a track you're partway through rather than always
+/// jumping back a full track.
+const RESTART_THRESHOLD: Duration = Duration::from_secs(3);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
     Stopped,
@@ -32,6 +44,7 @@ pub enum Status {
 
 #[derive(Debug, Clone, Default)]
 pub struct TrackMeta {
+    pub stream_url: String,
     pub title: String,
     pub artist: String,
     pub album: String,
@@ -49,6 +62,17 @@ pub struct Snapshot {
     pub position: Duration,
     pub track: Option<TrackMeta>,
     pub volume: f32,
+    /// 0-based position within the queue, and the queue's length — together
+    /// enough for a "track 3 of 12" display and for `CanGoNext`/
+    /// `CanGoPrevious`, without exposing the whole queue to every consumer.
+    pub queue_index: usize,
+    pub queue_len: usize,
+}
+
+impl Snapshot {
+    pub fn has_next(&self) -> bool {
+        self.queue_index + 1 < self.queue_len
+    }
 }
 
 impl Default for Snapshot {
@@ -58,17 +82,20 @@ impl Default for Snapshot {
             position: Duration::ZERO,
             track: None,
             volume: 1.0,
+            queue_index: 0,
+            queue_len: 0,
         }
     }
 }
 
 pub enum Command {
-    /// Starts streaming and playing `stream_url` immediately, replacing
-    /// whatever was playing.
-    Play {
-        stream_url: String,
-        meta: TrackMeta,
+    /// Replaces the queue and starts playing at `start_index` immediately.
+    PlayQueue {
+        tracks: Vec<TrackMeta>,
+        start_index: usize,
     },
+    Next,
+    Previous,
     Pause,
     Resume,
     Stop,
@@ -84,7 +111,10 @@ pub enum Event {
     /// [`PlaybackHandle::snapshot`] rather than carrying it here, since the
     /// MPRIS bridge needs it in `mpris_server`'s own `Metadata` shape anyway.
     TrackChanged,
-    TrackEnded,
+    /// The queue was exhausted (no next track) rather than just this one
+    /// track ending into another — distinct from `TrackChanged` so the MPRIS
+    /// bridge knows there's nothing more to report metadata for.
+    QueueEnded,
     /// A track failed to load/stream/decode — carries a message suitable for
     /// surfacing to the user (e.g. as a TUI toast), not full error internals.
     PlaybackError(String),
@@ -132,8 +162,14 @@ impl PlaybackHandle {
         }
     }
 
-    pub fn play(&self, stream_url: String, meta: TrackMeta) {
-        self.send(Command::Play { stream_url, meta });
+    pub fn play_queue(&self, tracks: Vec<TrackMeta>, start_index: usize) {
+        self.send(Command::PlayQueue { tracks, start_index });
+    }
+    pub fn next(&self) {
+        self.send(Command::Next);
+    }
+    pub fn previous(&self) {
+        self.send(Command::Previous);
     }
     pub fn pause(&self) {
         self.send(Command::Pause);
@@ -184,6 +220,8 @@ struct EngineState {
     stream_handle: OutputStreamHandle,
     sink: Option<Sink>,
     http: reqwest::blocking::Client,
+    queue: Vec<TrackMeta>,
+    index: usize,
 }
 
 fn run_engine(cmd_rx: Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>, events: UnboundedSender<Event>) {
@@ -200,12 +238,37 @@ fn run_engine(cmd_rx: Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>, events:
         stream_handle,
         sink: None,
         http: reqwest::blocking::Client::new(),
+        queue: Vec::new(),
+        index: 0,
     };
 
     loop {
         match cmd_rx.recv_timeout(POLL_INTERVAL) {
-            Ok(Command::Play { stream_url, meta }) => {
-                start_playback(&mut state, &snapshot, &events, stream_url, meta);
+            Ok(Command::PlayQueue { tracks, start_index }) => {
+                state.queue = tracks;
+                let start_index = start_index.min(state.queue.len().saturating_sub(1));
+                start_playback_at(&mut state, &snapshot, &events, start_index);
+            }
+            Ok(Command::Next) => {
+                if state.index + 1 < state.queue.len() {
+                    let next = state.index + 1;
+                    start_playback_at(&mut state, &snapshot, &events, next);
+                }
+                // No next track: matches the common player convention of
+                // doing nothing on "next" at the end of the queue, rather
+                // than stopping.
+            }
+            Ok(Command::Previous) => {
+                let restart_current = current_position(&state) > RESTART_THRESHOLD || state.index == 0;
+                if restart_current {
+                    if let Some(sink) = &state.sink {
+                        let _ = sink.try_seek(Duration::ZERO);
+                        snapshot.lock().expect("poisoned").position = Duration::ZERO;
+                    }
+                } else {
+                    let prev = state.index - 1;
+                    start_playback_at(&mut state, &snapshot, &events, prev);
+                }
             }
             Ok(Command::Pause) => {
                 if let Some(sink) = &state.sink {
@@ -251,25 +314,33 @@ fn run_engine(cmd_rx: Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>, events:
                 return;
             }
             Err(RecvTimeoutError::Timeout) => {
-                poll_progress(&state, &snapshot, &events);
+                poll_progress(&mut state, &snapshot, &events);
             }
             Err(RecvTimeoutError::Disconnected) => return,
         }
     }
 }
 
-fn start_playback(
+fn current_position(state: &EngineState) -> Duration {
+    state.sink.as_ref().map(Sink::get_pos).unwrap_or_default()
+}
+
+/// Starts playing `state.queue[index]`, replacing whatever was playing.
+fn start_playback_at(
     state: &mut EngineState,
     snapshot: &Arc<Mutex<Snapshot>>,
     events: &UnboundedSender<Event>,
-    stream_url: String,
-    meta: TrackMeta,
+    index: usize,
 ) {
     if let Some(sink) = state.sink.take() {
         sink.stop();
     }
+    let Some(meta) = state.queue.get(index).cloned() else {
+        return;
+    };
+    state.index = index;
 
-    let reader = RangeReader::new(state.http.clone(), stream_url);
+    let reader = RangeReader::new(state.http.clone(), meta.stream_url.clone());
     let decoder = match Decoder::new(reader) {
         Ok(d) => d,
         Err(e) => {
@@ -293,26 +364,35 @@ fn start_playback(
         let mut snap = snapshot.lock().expect("poisoned");
         snap.status = Status::Playing;
         snap.position = Duration::ZERO;
-        snap.track = Some(meta.clone());
+        snap.track = Some(meta);
+        snap.queue_index = index;
+        snap.queue_len = state.queue.len();
     }
     state.sink = Some(sink);
     let _ = events.send(Event::TrackChanged);
     let _ = events.send(Event::StatusChanged(Status::Playing));
 }
 
-fn poll_progress(state: &EngineState, snapshot: &Arc<Mutex<Snapshot>>, events: &UnboundedSender<Event>) {
+fn poll_progress(state: &mut EngineState, snapshot: &Arc<Mutex<Snapshot>>, events: &UnboundedSender<Event>) {
     let Some(sink) = &state.sink else { return };
-
     let ended = sink.empty();
-    let mut snap = snapshot.lock().expect("poisoned");
-    if ended && snap.status == Status::Playing {
-        snap.status = Status::Stopped;
-        drop(snap);
-        let _ = events.send(Event::TrackEnded);
-        let _ = events.send(Event::StatusChanged(Status::Stopped));
+    let currently_playing = snapshot.lock().expect("poisoned").status == Status::Playing;
+
+    if ended && currently_playing {
+        if state.index + 1 < state.queue.len() {
+            let next = state.index + 1;
+            start_playback_at(state, snapshot, events, next);
+        } else {
+            snapshot.lock().expect("poisoned").status = Status::Stopped;
+            let _ = events.send(Event::QueueEnded);
+            let _ = events.send(Event::StatusChanged(Status::Stopped));
+        }
         return;
     }
-    snap.position = sink.get_pos();
+
+    if let Some(sink) = &state.sink {
+        snapshot.lock().expect("poisoned").position = sink.get_pos();
+    }
 }
 
 fn set_status(snapshot: &Arc<Mutex<Snapshot>>, events: &UnboundedSender<Event>, status: Status) {

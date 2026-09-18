@@ -9,15 +9,17 @@ via MPRIS — that survives closing the terminal.
 MPRIS/media-key control needs a process that outlives the terminal window a
 TUI runs in, so this is split like `mpd`/`ncmpcpp`:
 
-- **`maraetaid`** — the daemon. Owns the audio output device and decode
-  pipeline, and exposes two D-Bus interfaces on the session bus: the standard
-  `org.mpris.MediaPlayer2`/`.Player` (so GNOME/KDE/`playerctl`/media keys
-  already know how to talk to it) and a small custom
-  `com.maraetai.Daemon1` for everything MPRIS doesn't cover (loading a
-  specific track, explicit shutdown).
+- **`maraetaid`** — the daemon. Owns the audio output device, decode
+  pipeline, and the **queue**, and exposes two D-Bus interfaces on the
+  session bus: the standard `org.mpris.MediaPlayer2`/`.Player` (so
+  GNOME/KDE/`playerctl`/media keys already know how to talk to it — including
+  real `Next`/`Previous`) and a small custom `com.maraetai.Daemon1` for
+  everything MPRIS doesn't cover (loading a whole queue, explicit shutdown).
+  The queue lives here, not in the TUI, specifically so hardware media-key
+  Next/Previous — which never go anywhere near the TUI — actually work.
 - **`maraetai`** — the TUI. A thin client: talks to `maraetaid` over D-Bus
-  for playback control, and talks directly to `maraetai-service`'s existing
-  Subsonic API for browsing albums and search, the same way every other
+  for playback/queue control, and talks directly to `maraetai-service`'s
+  existing Subsonic API for browsing/search, the same way every other
   maraetai client already does. It also carries the CLI (`login`,
   `daemon status`/`stop`, `play <song-id>`).
 
@@ -30,8 +32,8 @@ about and leave using resources. So:
 - `maraetai` auto-spawns `maraetaid` on first use if it isn't already running
   (checked via a real D-Bus RPC, not just process/pidfile presence).
 - The daemon shuts itself down automatically after being idle — nothing
-  playing **and** no client activity — for a configurable timeout (currently
-  a hardcoded 20 minutes; see `daemon/src/main.rs::IDLE_TIMEOUT`). It will
+  playing **and** no client activity — for a configurable timeout (default
+  20 minutes; set `idle_timeout_secs` in `config.toml` to change it). It will
   never idle-shutdown while a track is actually playing, even with the
   terminal closed.
 - `maraetai daemon stop` (or pressing `Q` in the TUI) asks it to quit
@@ -66,28 +68,28 @@ cargo build --workspace
                                      # Enter to play, auto-spawning maraetaid
 ```
 
-In the TUI: arrow keys/`j`/`k` to move, `Enter` to open an album or play a
-song, `/` to search, `Esc`/`Backspace` to go back, `space` to play/pause,
-`s` to stop, `q` to quit (daemon keeps running), `Q` to quit and stop it.
+In the TUI: arrow keys/`j`/`k` to move, `Enter` to open a list or play from
+the selected song onward (queuing the rest of that list), `/` to search,
+`Esc`/`Backspace` to go back, `space` to play/pause, `n`/`p` for next/
+previous track, `s` to stop, `q` to quit (daemon keeps running), `Q` to quit
+and stop it.
 
 ## Parity with the other maraetai clients
 
 | Feature | iOS/macOS | Android | Web | **TUI** |
 |---|---|---|---|---|
-| Browse albums | ✅ | ✅ | ✅ | ✅ |
-| Browse artists/playlists/genres | ✅ | ✅ | ✅ | ❌ *(planned)* |
+| Browse albums/artists/playlists/genres | ✅ | ✅ | ✅ | ✅ |
 | Search | ✅ | ✅ | ✅ | ✅ *(songs only)* |
-| Playback (stream, seek, queue) | ✅ | ✅ | ✅ | ✅ *(single track; queue planned)* |
+| Playback (stream, seek, queue, next/previous) | ✅ | ✅ | ✅ | ✅ |
 | Favourites / playlists edit | ✅ | ✅ | ✅ | ❌ *(planned)* |
-| OS media-key / lock-screen integration | ✅ (native) | ✅ (native) | ❌ | ✅ (MPRIS) |
+| OS media-key / lock-screen integration | ✅ (native) | ✅ (native) | ❌ | ✅ (MPRIS, incl. Next/Previous) |
 | Credential storage | Keychain | SharedPreferences | localStorage (plaintext) | **OS keyring** |
 | Survives the app/window closing | n/a | n/a | ❌ | ✅ (daemon) |
 
 ## Scope: OUT (v1)
 
-- No artist/playlist/genre browsing yet — only albums and song search.
-  `maraetai play <song-id>` also exists for direct testing.
-- No queue/playlist management — one track at a time.
+- No favourites/playlist editing (create/rename/add-to/remove-from) — read
+  and play only.
 - No systemd/launchd unit shipped by default — spawn-on-demand +
   idle-shutdown is the default experience, not an always-on service (see
   above). A `--user` systemd unit could be a documented *optional* opt-in

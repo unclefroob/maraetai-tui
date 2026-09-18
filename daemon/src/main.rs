@@ -5,10 +5,9 @@ mod playback;
 mod range_reader;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
-use maraetai_common::{Credentials, dbus};
+use maraetai_common::{Config, Credentials, dbus};
 use mpris_server::{PlayerInterface, Property, Server, Signal, Time};
 use tokio::sync::Notify;
 use zbus::connection;
@@ -16,12 +15,6 @@ use zbus::connection;
 use control::ControlInterface;
 use mpris::MprisPlayer;
 use playback::Event;
-
-/// How long the daemon may sit with nothing playing and no client activity
-/// before it shuts itself down — see `lifecycle::run_idle_timer`. Not yet
-/// user-configurable (planned: read from `Config`); 20 minutes is a
-/// deliberately conservative starting default.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -32,10 +25,14 @@ async fn main() -> Result<()> {
     let _instance_guard = lifecycle::acquire_single_instance_lock()
         .context("could not start maraetaid — is another instance already running?")?;
 
-    // Credentials are loaded but not *required* to start: the daemon should
-    // still come up (and answer `status`/be visible over D-Bus) even before
-    // `maraetai login` has been run, rather than crash-loop on a fresh
-    // install.
+    // Config/credentials are loaded but not *required* to start: the daemon
+    // should still come up (and answer `status`/be visible over D-Bus) even
+    // before `maraetai login` has been run, rather than crash-loop on a
+    // fresh install. The idle timeout still applies either way — falling
+    // back to Config::idle_timeout's built-in default when unconfigured.
+    let idle_timeout = Config::load().map(|c| c.idle_timeout()).unwrap_or_else(|_| {
+        std::time::Duration::from_secs(maraetai_common::config::DEFAULT_IDLE_TIMEOUT_SECS)
+    });
     match Credentials::load() {
         Ok(creds) => {
             tracing::info!(server = %creds.server_url, user = %creds.username, "credentials loaded");
@@ -76,12 +73,13 @@ async fn main() -> Result<()> {
     tokio::spawn(lifecycle::run_idle_timer(
         playback.clone(),
         Arc::clone(&shutdown),
-        IDLE_TIMEOUT,
+        idle_timeout,
     ));
 
     tracing::info!(
         mpris_bus = %mpris_server.bus_name(),
         control_bus = dbus::CONTROL_BUS_NAME,
+        idle_timeout = ?idle_timeout,
         "maraetaid ready"
     );
 
@@ -136,8 +134,8 @@ async fn bridge_playback_events_to_mpris(
                     tracing::warn!("failed to emit Seeked signal: {e}");
                 }
             }
-            Event::TrackEnded => {
-                tracing::debug!("track ended");
+            Event::QueueEnded => {
+                tracing::debug!("queue ended");
             }
             Event::PlaybackError(msg) => {
                 tracing::warn!("playback error: {msg}");

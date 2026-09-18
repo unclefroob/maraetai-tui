@@ -19,6 +19,31 @@ pub struct Album {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct Artist {
+    pub id: String,
+    pub name: String,
+    #[serde(default, rename = "albumCount")]
+    pub album_count: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Playlist {
+    pub id: String,
+    pub name: String,
+    #[serde(default, rename = "songCount")]
+    pub song_count: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Genre {
+    pub value: String,
+    #[serde(default, rename = "songCount")]
+    pub song_count: u32,
+    #[serde(default, rename = "albumCount")]
+    pub album_count: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct Song {
     pub id: String,
     pub title: String,
@@ -85,6 +110,49 @@ impl Client {
             )
             .await?;
         parse(root["searchResult3"]["song"].take())
+    }
+
+    /// The full artist index, flattened across Subsonic's alphabetical index
+    /// groups (`artists.index[].artist[]`) — the same flattening the web
+    /// client does client-side.
+    pub async fn artists(&self) -> Result<Vec<Artist>> {
+        let root = self.get_json("rest/getArtists.view", &[]).await?;
+        let groups = root["artists"]["index"].as_array().cloned().unwrap_or_default();
+        let mut out = Vec::new();
+        for mut group in groups {
+            out.extend(parse::<Artist>(group["artist"].take())?);
+        }
+        Ok(out)
+    }
+
+    pub async fn artist_albums(&self, artist_id: &str) -> Result<Vec<Album>> {
+        let mut root = self.get_json("rest/getArtist.view", &[("id", artist_id)]).await?;
+        parse(root["artist"]["album"].take())
+    }
+
+    pub async fn playlists(&self) -> Result<Vec<Playlist>> {
+        let mut root = self.get_json("rest/getPlaylists.view", &[]).await?;
+        parse(root["playlists"]["playlist"].take())
+    }
+
+    /// Note: Subsonic's `getPlaylist` nests its songs under `entry`, not
+    /// `song` (unlike every other endpoint here) — matched exactly against
+    /// `maraetai-service`'s web client, which has the same quirk.
+    pub async fn playlist_songs(&self, playlist_id: &str) -> Result<Vec<Song>> {
+        let mut root = self.get_json("rest/getPlaylist.view", &[("id", playlist_id)]).await?;
+        parse(root["playlist"]["entry"].take())
+    }
+
+    pub async fn genres(&self) -> Result<Vec<Genre>> {
+        let mut root = self.get_json("rest/getGenres.view", &[]).await?;
+        parse(root["genres"]["genre"].take())
+    }
+
+    pub async fn albums_by_genre(&self, genre: &str) -> Result<Vec<Album>> {
+        let mut root = self
+            .get_json("rest/getAlbumList2.view", &[("type", "byGenre"), ("genre", genre), ("size", "200")])
+            .await?;
+        parse(root["albumList2"]["album"].take())
     }
 
     fn authed_url(&self, path: &str, extra: &[(&str, &str)]) -> String {

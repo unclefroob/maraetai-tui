@@ -75,9 +75,15 @@ async fn run_daemon_action(action: DaemonAction) -> Result<()> {
     match action {
         DaemonAction::Status => match proxy {
             Ok(proxy) => match proxy.status().await {
-                Ok((status, title, position)) => {
+                Ok((status, title, position, queue_index, queue_len)) => {
                     if title.is_empty() {
                         println!("daemon running — {status}");
+                    } else if queue_len > 0 {
+                        println!(
+                            "daemon running — {status}: {title} ({position:.1}s) [{} of {}]",
+                            queue_index + 1,
+                            queue_len
+                        );
                     } else {
                         println!("daemon running — {status}: {title} ({position:.1}s)");
                     }
@@ -110,17 +116,18 @@ async fn run_play(
     let proxy = dbus_client::connect(&connection)
         .await
         .context("connecting to daemon control interface")?;
+    let track = (
+        stream_url,
+        title.unwrap_or_default(),
+        artist.unwrap_or_default(),
+        album.unwrap_or_default(),
+        String::new(),
+        0.0,
+    );
     proxy
-        .play_url(
-            &stream_url,
-            &title.unwrap_or_default(),
-            &artist.unwrap_or_default(),
-            &album.unwrap_or_default(),
-            "",
-            0.0,
-        )
+        .play_queue(vec![track], 0)
         .await
-        .context("sending PlayUrl to the daemon")?;
+        .context("sending PlayQueue to the daemon")?;
     println!("playing song {song_id}");
     Ok(())
 }

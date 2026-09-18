@@ -78,13 +78,12 @@ impl RootInterface for MprisPlayer {
 
 impl PlayerInterface for MprisPlayer {
     async fn next(&self) -> fdo::Result<()> {
-        // Queue advancement lives in the TUI/control layer (it decides what
-        // "next" means against the current playlist), not in the daemon's
-        // playback engine — see `com.maraetai.Daemon1`'s queue methods.
+        self.playback.next();
         Ok(())
     }
 
     async fn previous(&self) -> fdo::Result<()> {
+        self.playback.previous();
         Ok(())
     }
 
@@ -212,11 +211,14 @@ impl PlayerInterface for MprisPlayer {
     }
 
     async fn can_go_next(&self) -> fdo::Result<bool> {
-        Ok(false)
+        Ok(self.playback.snapshot().has_next())
     }
 
     async fn can_go_previous(&self) -> fdo::Result<bool> {
-        Ok(false)
+        // Always true in practice — "previous" restarts the current track
+        // when there's nothing earlier in the queue, matching common player
+        // convention (see playback.rs's RESTART_THRESHOLD).
+        Ok(true)
     }
 
     async fn can_play(&self) -> fdo::Result<bool> {
