@@ -67,6 +67,10 @@ pub struct Snapshot {
     /// `CanGoPrevious`, without exposing the whole queue to every consumer.
     pub queue_index: usize,
     pub queue_len: usize,
+    /// The full queue, in order — for a TUI "Queue" view. Cloned into the
+    /// snapshot only when the queue actually changes (`PlayQueue`), not on
+    /// every poll tick, so this doesn't add per-tick cost.
+    pub queue: Vec<TrackMeta>,
 }
 
 impl Snapshot {
@@ -84,6 +88,7 @@ impl Default for Snapshot {
             volume: 1.0,
             queue_index: 0,
             queue_len: 0,
+            queue: Vec::new(),
         }
     }
 }
@@ -94,6 +99,10 @@ pub enum Command {
         tracks: Vec<TrackMeta>,
         start_index: usize,
     },
+    /// Jumps directly to `index` within the *current* queue (a TUI "Queue"
+    /// view picking an arbitrary upcoming track) — distinct from `PlayQueue`,
+    /// which replaces the queue itself.
+    PlayAt(usize),
     Next,
     Previous,
     Pause,
@@ -164,6 +173,9 @@ impl PlaybackHandle {
 
     pub fn play_queue(&self, tracks: Vec<TrackMeta>, start_index: usize) {
         self.send(Command::PlayQueue { tracks, start_index });
+    }
+    pub fn play_at(&self, index: usize) {
+        self.send(Command::PlayAt(index));
     }
     pub fn next(&self) {
         self.send(Command::Next);
@@ -246,8 +258,14 @@ fn run_engine(cmd_rx: Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>, events:
         match cmd_rx.recv_timeout(POLL_INTERVAL) {
             Ok(Command::PlayQueue { tracks, start_index }) => {
                 state.queue = tracks;
+                snapshot.lock().expect("poisoned").queue = state.queue.clone();
                 let start_index = start_index.min(state.queue.len().saturating_sub(1));
                 start_playback_at(&mut state, &snapshot, &events, start_index);
+            }
+            Ok(Command::PlayAt(index)) => {
+                if index < state.queue.len() {
+                    start_playback_at(&mut state, &snapshot, &events, index);
+                }
             }
             Ok(Command::Next) => {
                 if state.index + 1 < state.queue.len() {

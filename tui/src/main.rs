@@ -75,17 +75,25 @@ async fn run_daemon_action(action: DaemonAction) -> Result<()> {
     match action {
         DaemonAction::Status => match proxy {
             Ok(proxy) => match proxy.status().await {
-                Ok((status, title, position, queue_index, queue_len)) => {
+                Ok((status, title, artist, _album, position, duration, queue_index, queue_len, _volume)) => {
                     if title.is_empty() {
                         println!("daemon running — {status}");
-                    } else if queue_len > 0 {
-                        println!(
-                            "daemon running — {status}: {title} ({position:.1}s) [{} of {}]",
-                            queue_index + 1,
-                            queue_len
-                        );
                     } else {
-                        println!("daemon running — {status}: {title} ({position:.1}s)");
+                        let by = if artist.is_empty() { String::new() } else { format!(" by {artist}") };
+                        let dur = if duration > 0.0 {
+                            format!("{position:.1}s / {duration:.1}s")
+                        } else {
+                            format!("{position:.1}s")
+                        };
+                        if queue_len > 0 {
+                            println!(
+                                "daemon running — {status}: {title}{by} ({dur}) [{} of {}]",
+                                queue_index + 1,
+                                queue_len
+                            );
+                        } else {
+                            println!("daemon running — {status}: {title}{by} ({dur})");
+                        }
                     }
                 }
                 Err(_) => println!("daemon not running"),

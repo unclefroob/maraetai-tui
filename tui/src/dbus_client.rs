@@ -19,6 +19,8 @@ pub type QueueEntry = (String, String, String, String, String, f64);
 )]
 pub trait Control {
     async fn play_queue(&self, tracks: Vec<QueueEntry>, start_index: u32) -> zbus::Result<()>;
+    async fn play_at(&self, index: u32) -> zbus::Result<()>;
+    async fn queue(&self) -> zbus::Result<Vec<(String, String, String, f64)>>;
     async fn next(&self) -> zbus::Result<()>;
     async fn previous(&self) -> zbus::Result<()>;
     async fn pause(&self) -> zbus::Result<()>;
@@ -26,7 +28,8 @@ pub trait Control {
     async fn stop(&self) -> zbus::Result<()>;
     async fn seek_to(&self, position_secs: f64) -> zbus::Result<()>;
     async fn set_volume(&self, volume: f64) -> zbus::Result<()>;
-    async fn status(&self) -> zbus::Result<(String, String, f64, u32, u32)>;
+    #[allow(clippy::type_complexity)]
+    async fn status(&self) -> zbus::Result<(String, String, String, String, f64, f64, u32, u32, f64)>;
     async fn quit(&self) -> zbus::Result<()>;
 }
 

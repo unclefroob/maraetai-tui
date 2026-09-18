@@ -57,6 +57,26 @@ impl ControlInterface {
         self.playback.play_queue(tracks, start_index as usize);
     }
 
+    /// Jumps directly to `index` within the *current* queue — for a TUI
+    /// "Queue" view where the user picks an arbitrary upcoming track,
+    /// distinct from `PlayQueue` (which replaces the queue).
+    async fn play_at(&self, index: u32) {
+        self.playback.play_at(index as usize);
+    }
+
+    /// The full current queue: (title, artist, album, duration_secs) per
+    /// track, in order — for a TUI "Queue" view. Not a property (like
+    /// MPRIS's `Metadata`) since it's a list, not a single value, and this
+    /// project doesn't implement MPRIS's TrackList interface.
+    async fn queue(&self) -> Vec<(String, String, String, f64)> {
+        self.playback
+            .snapshot()
+            .queue
+            .into_iter()
+            .map(|t| (t.title, t.artist, t.album, t.duration.map(|d| d.as_secs_f64()).unwrap_or(0.0)))
+            .collect()
+    }
+
     /// Also exposed here (identical to MPRIS's own `Next`) purely so the TUI
     /// only needs one D-Bus connection/proxy — real hardware media keys go
     /// through the standard `org.mpris.MediaPlayer2.Player.Next` in
@@ -92,27 +112,36 @@ impl ControlInterface {
         self.playback.set_volume(volume.clamp(0.0, 1.0) as f32);
     }
 
-    /// A compact status summary for `maraetai daemon status`: playback
-    /// status, current track title (empty if none), position in seconds,
-    /// and (queue index, queue length) for a "track 3 of 12" display. Kept
-    /// as a plain method (not properties) since it's a point-in-time
-    /// snapshot read by a one-shot CLI command, not something a D-Bus client
+    /// A compact status summary for `maraetai daemon status` and the TUI's
+    /// now-playing bar: playback status, current track (title, artist,
+    /// album), position/duration in seconds (duration 0 if unknown),
+    /// (queue index, queue length), and volume (0.0-1.0). Kept as a plain
+    /// method (not properties) since it's a point-in-time snapshot read by a
+    /// one-shot CLI command or a polling loop, not something a D-Bus client
     /// watches for changes — that's what MPRIS's properties (which do emit
     /// `PropertiesChanged`) are for.
-    async fn status(&self) -> (String, String, f64, u32, u32) {
+    #[allow(clippy::type_complexity)]
+    async fn status(&self) -> (String, String, String, String, f64, f64, u32, u32, f64) {
         let snap = self.playback.snapshot();
         let status = match snap.status {
             Status::Playing => "playing",
             Status::Paused => "paused",
             Status::Stopped => "stopped",
         };
-        let title = snap.track.map(|t| t.title).unwrap_or_default();
+        let (title, artist, album, duration) = match snap.track {
+            Some(t) => (t.title, t.artist, t.album, t.duration.map(|d| d.as_secs_f64()).unwrap_or(0.0)),
+            None => (String::new(), String::new(), String::new(), 0.0),
+        };
         (
             status.to_string(),
             title,
+            artist,
+            album,
             snap.position.as_secs_f64(),
+            duration,
             snap.queue_index as u32,
             snap.queue_len as u32,
+            snap.volume as f64,
         )
     }
 

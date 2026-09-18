@@ -3,6 +3,12 @@
 //! way every other maraetai client does) and to the daemon over D-Bus for
 //! playback/queue control.
 //!
+//! Visually modeled on `cmus`: a colored, always-visible now-playing bar
+//! with a real progress gauge, column-aligned track tables instead of
+//! plain text lists, the currently-playing row highlighted wherever it
+//! appears, and `1`/`2` as quick view switches (Library / Queue) alongside
+//! the drill-down navigation stack.
+//!
 //! Navigation is a plain stack (`Vec<Screen>`) — drilling in pushes, `Esc`/
 //! `Backspace` pops. Playing a song from a list queues the *rest* of that
 //! list from the selected point onward (so picking track 3 of an album
@@ -16,15 +22,46 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Row, Table, TableState};
 
 use crate::dbus_client::{ControlProxy, QueueEntry};
 use crate::library::{self, Album, Artist, Genre, Playlist, Song};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const MENU_ITEMS: [&str; 4] = ["Albums", "Artists", "Playlists", "Genres"];
+const SEEK_STEP: f64 = 5.0;
+const VOLUME_STEP: f64 = 0.05;
+
+/// A cmus-inspired palette — cyan accents on the default terminal
+/// background, a blue selection bar, yellow column headers.
+mod theme {
+    use ratatui::style::{Color, Modifier, Style};
+
+    pub fn accent() -> Style {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    }
+    pub fn header() -> Style {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    }
+    pub fn selected() -> Style {
+        Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)
+    }
+    pub fn now_playing_row() -> Style {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    }
+    pub fn muted() -> Style {
+        Style::default().fg(Color::DarkGray)
+    }
+    pub fn border() -> Style {
+        Style::default().fg(Color::Cyan)
+    }
+}
+
+/// One entry in the "Queue" view — title/artist/album/duration, as returned
+/// by the daemon's `Queue()` method.
+type QueueRow = (String, String, String, f64);
 
 enum Screen {
     Menu {
@@ -58,15 +95,24 @@ enum Screen {
         results: Vec<Song>,
         selected: usize,
     },
+    /// The daemon's actual current queue — `Enter` jumps straight to that
+    /// track via `PlayAt`, unlike other lists which start a *new* queue.
+    Queue {
+        tracks: Vec<QueueRow>,
+        selected: usize,
+    },
 }
 
 /// A point-in-time playback status snapshot, as returned by `Status()`.
 struct NowPlaying {
     status: String,
     title: String,
+    artist: String,
     position: f64,
+    duration: f64,
     queue_index: u32,
     queue_len: u32,
+    volume: f64,
 }
 
 struct App<'a> {
@@ -91,6 +137,11 @@ pub async fn run(proxy: ControlProxy<'_>, creds: maraetai_common::Credentials) -
     let result = app.event_loop(&mut terminal).await;
     ratatui::restore();
     result
+}
+
+fn fmt_time(secs: f64) -> String {
+    let secs = secs.max(0.0) as u64;
+    format!("{}:{:02}", secs / 60, secs % 60)
 }
 
 impl App<'_> {
@@ -142,6 +193,25 @@ impl App<'_> {
                 KeyCode::Char('p') => {
                     let _ = self.proxy.previous().await;
                 }
+                KeyCode::Left => {
+                    let target = (now_playing.position - SEEK_STEP).max(0.0);
+                    let _ = self.proxy.seek_to(target).await;
+                }
+                KeyCode::Right => {
+                    let _ = self.proxy.seek_to(now_playing.position + SEEK_STEP).await;
+                }
+                KeyCode::Char('-') => {
+                    let _ = self.proxy.set_volume((now_playing.volume - VOLUME_STEP).max(0.0)).await;
+                }
+                KeyCode::Char('+') | KeyCode::Char('=') => {
+                    let _ = self.proxy.set_volume((now_playing.volume + VOLUME_STEP).min(1.0)).await;
+                }
+                KeyCode::Char('1') => {
+                    self.stack = vec![Screen::Menu { selected: 0 }];
+                }
+                KeyCode::Char('2') => {
+                    self.load_queue_view(terminal).await;
+                }
                 KeyCode::Char('/') => {
                     self.stack.push(Screen::Search {
                         query: String::new(),
@@ -153,10 +223,9 @@ impl App<'_> {
                 KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
                 KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
                 KeyCode::Enter => self.activate_selection(terminal).await,
-                KeyCode::Esc | KeyCode::Backspace
-                    if self.stack.len() > 1 => {
-                        self.stack.pop();
-                    }
+                KeyCode::Esc | KeyCode::Backspace if self.stack.len() > 1 => {
+                    self.stack.pop();
+                }
                 _ => {}
             }
         }
@@ -164,20 +233,38 @@ impl App<'_> {
 
     async fn fetch_status(&self) -> NowPlaying {
         match self.proxy.status().await {
-            Ok((status, title, position, queue_index, queue_len)) => NowPlaying {
+            Ok((status, title, artist, _album, position, duration, queue_index, queue_len, volume)) => NowPlaying {
                 status,
                 title,
+                artist,
                 position,
+                duration,
                 queue_index,
                 queue_len,
+                volume,
             },
             Err(_) => NowPlaying {
                 status: "disconnected".to_string(),
                 title: String::new(),
+                artist: String::new(),
                 position: 0.0,
+                duration: 0.0,
                 queue_index: 0,
                 queue_len: 0,
+                volume: 1.0,
             },
+        }
+    }
+
+    async fn load_queue_view(&mut self, terminal: &mut ratatui::DefaultTerminal) {
+        self.message = "Loading queue…".to_string();
+        let _ = terminal.draw(|f| self.draw_message(f));
+        match self.proxy.queue().await {
+            Ok(tracks) => {
+                self.message.clear();
+                self.stack.push(Screen::Queue { tracks, selected: 0 });
+            }
+            Err(e) => self.message = format!("error: {e}"),
         }
     }
 
@@ -219,6 +306,7 @@ impl App<'_> {
             Screen::ArtistList { selected, artists } => (selected, artists.len()),
             Screen::PlaylistList { selected, playlists } => (selected, playlists.len()),
             Screen::GenreList { selected, genres } => (selected, genres.len()),
+            Screen::Queue { selected, tracks } => (selected, tracks.len()),
             Screen::Search { selected, results, editing, .. } if !*editing => (selected, results.len()),
             Screen::Search { .. } => return,
         };
@@ -281,14 +369,26 @@ impl App<'_> {
                 }
             }
             Screen::Search { .. } => {}
+            Screen::Queue { selected, tracks } => {
+                if !tracks.is_empty() {
+                    let index = *selected as u32;
+                    match self.proxy.play_at(index).await {
+                        Ok(()) => self.message.clear(),
+                        Err(e) => self.message = format!("could not jump to track: {e}"),
+                    }
+                }
+            }
         }
     }
 
     async fn enter_menu_item(&mut self, terminal: &mut ratatui::DefaultTerminal, selected: usize) {
         match MENU_ITEMS.get(selected).copied() {
             Some("Albums") => {
-                if let Some(albums) = self.load(terminal, "Loading albums…", |c| Box::pin(async move { c.albums().await }))
-                    .await { self.stack.push(Screen::AlbumList { title: "Albums".into(), albums, selected: 0 }) }
+                if let Some(albums) =
+                    self.load(terminal, "Loading albums…", |c| Box::pin(async move { c.albums().await })).await
+                {
+                    self.stack.push(Screen::AlbumList { title: "Albums".into(), albums, selected: 0 });
+                }
             }
             Some("Artists") => {
                 if let Some(artists) = self
@@ -409,14 +509,14 @@ impl App<'_> {
 
     fn draw_message(&self, frame: &mut Frame) {
         let para = Paragraph::new(self.message.as_str())
-            .block(Block::default().borders(Borders::ALL).title(" Maraetai "));
+            .block(Block::default().borders(Borders::ALL).border_style(theme::border()).title(" Maraetai "));
         frame.render_widget(para, frame.area());
     }
 
     fn draw(&self, frame: &mut Frame, now_playing: &NowPlaying) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(4)])
+            .constraints([Constraint::Min(3), Constraint::Length(6)])
             .split(frame.area());
 
         match self.top() {
@@ -424,7 +524,7 @@ impl App<'_> {
                 self.draw_list(
                     frame,
                     chunks[0],
-                    " Maraetai — [Enter] open  [/] search  [q] quit ",
+                    " Maraetai — [Enter] open  [/] search  [1] library  [2] queue  [q] quit ",
                     MENU_ITEMS.iter().map(|s| s.to_string()),
                     *selected,
                 );
@@ -439,12 +539,16 @@ impl App<'_> {
                 );
             }
             Screen::SongList { title, songs, selected } => {
-                self.draw_list(
+                let rows = songs
+                    .iter()
+                    .map(|s| (s.title.as_str(), s.artist.as_str(), s.album.as_str(), s.duration));
+                self.draw_song_table(
                     frame,
                     chunks[0],
                     &format!(" {title} — [Enter] play from here  [Esc] back "),
-                    songs.iter().map(|s| format!("{}  —  {}", s.title, s.artist)),
+                    rows,
                     *selected,
+                    &now_playing.title,
                 );
             }
             Screen::ArtistList { artists, selected } => {
@@ -482,12 +586,20 @@ impl App<'_> {
                 } else {
                     format!(" Search: {query}  [Enter] play from here  [Esc] back ")
                 };
-                self.draw_list(
+                let rows = results
+                    .iter()
+                    .map(|s| (s.title.as_str(), s.artist.as_str(), s.album.as_str(), s.duration));
+                self.draw_song_table(frame, chunks[0], &title, rows, *selected, &now_playing.title);
+            }
+            Screen::Queue { tracks, selected } => {
+                let rows = tracks.iter().map(|(t, a, al, d)| (t.as_str(), a.as_str(), al.as_str(), *d));
+                self.draw_song_table(
                     frame,
                     chunks[0],
-                    &title,
-                    results.iter().map(|s| format!("{}  —  {}  ({})", s.title, s.artist, s.album)),
+                    " Queue — [Enter] jump to track  [Esc] back ",
+                    rows,
                     *selected,
+                    &now_playing.title,
                 );
             }
         }
@@ -499,8 +611,8 @@ impl App<'_> {
         let items: Vec<ListItem> = items.map(ListItem::new).collect();
         let empty = items.is_empty();
         let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(title.to_string()))
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+            .block(Block::default().borders(Borders::ALL).border_style(theme::border()).title(title.to_string()))
+            .highlight_style(theme::selected());
         let mut state = ListState::default();
         if !empty {
             state.select(Some(selected));
@@ -508,24 +620,109 @@ impl App<'_> {
         frame.render_stateful_widget(list, area, &mut state);
     }
 
-    fn draw_status_bar(&self, frame: &mut Frame, area: Rect, now_playing: &NowPlaying) {
-        let track = if now_playing.title.is_empty() { "(nothing loaded)" } else { &now_playing.title };
-        let queue_info = if now_playing.queue_len > 0 {
-            format!("  [{} of {}]", now_playing.queue_index + 1, now_playing.queue_len)
-        } else {
-            String::new()
-        };
-        let line1 = if self.message.is_empty() {
-            format!("{} — {track} ({:.0}s){queue_info}", now_playing.status, now_playing.position)
-        } else {
-            self.message.clone()
-        };
-        let text = vec![
-            Line::from(line1),
-            Line::from("[space] play/pause  [n]ext  [p]revious  [s]top  [Q] quit + stop daemon"),
+    /// Renders a column-aligned track table (Title / Artist / Album / Time),
+    /// cmus-style, with the currently-playing row (matched by title — the
+    /// only stable identifier available client-side) highlighted regardless
+    /// of cursor position.
+    fn draw_song_table<'r>(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        title: &str,
+        rows: impl Iterator<Item = (&'r str, &'r str, &'r str, f64)>,
+        selected: usize,
+        now_playing_title: &str,
+    ) {
+        let mut any = false;
+        let table_rows: Vec<Row> = rows
+            .map(|(t, artist, album, dur)| {
+                any = true;
+                let is_playing = !now_playing_title.is_empty() && t == now_playing_title;
+                let style = if is_playing { theme::now_playing_row() } else { Style::default() };
+                Row::new(vec![t.to_string(), artist.to_string(), album.to_string(), fmt_time(dur)]).style(style)
+            })
+            .collect();
+
+        let header = Row::new(vec!["Title", "Artist", "Album", "Time"]).style(theme::header());
+        let widths = [
+            Constraint::Percentage(40),
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
+            Constraint::Length(6),
         ];
-        let para =
-            Paragraph::new(text).block(Block::default().borders(Borders::ALL).title(" Now Playing "));
-        frame.render_widget(para, area);
+        let table = Table::new(table_rows, widths)
+            .header(header)
+            .block(Block::default().borders(Borders::ALL).border_style(theme::border()).title(title.to_string()))
+            .highlight_style(theme::selected());
+
+        let mut state = TableState::default();
+        if any {
+            state.select(Some(selected));
+        }
+        frame.render_stateful_widget(table, area, &mut state);
+    }
+
+    fn draw_status_bar(&self, frame: &mut Frame, area: Rect, now_playing: &NowPlaying) {
+        // `Block::inner` already accounts for the border on all four sides —
+        // an additional `.margin(1)` on the Layout on top of that left only
+        // 2 rows of space for the 3 requested (Length(1) x3), silently
+        // clipping the gauge/status line. No extra margin needed here.
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)])
+            .split(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(theme::border())
+                    .title(" Now Playing ")
+                    .inner(area),
+            );
+        frame.render_widget(
+            Block::default().borders(Borders::ALL).border_style(theme::border()).title(" Now Playing "),
+            area,
+        );
+
+        // Line 1: track — artist, styled like cmus's colored track line.
+        let track = if now_playing.title.is_empty() { "(nothing loaded)" } else { &now_playing.title };
+        let mut spans = vec![Span::styled(track, theme::accent())];
+        if !now_playing.artist.is_empty() {
+            spans.push(Span::raw("  —  "));
+            spans.push(Span::styled(&now_playing.artist, Style::default().fg(Color::White)));
+        }
+        if now_playing.queue_len > 0 {
+            spans.push(Span::styled(
+                format!("   [{} of {}]", now_playing.queue_index + 1, now_playing.queue_len),
+                theme::muted(),
+            ));
+        }
+        if !self.message.is_empty() {
+            spans = vec![Span::raw(self.message.clone())];
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
+
+        // Line 2: a real progress gauge (position/duration), cmus-style.
+        let ratio = if now_playing.duration > 0.0 {
+            (now_playing.position / now_playing.duration).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let label = if now_playing.duration > 0.0 {
+            format!("{} / {}", fmt_time(now_playing.position), fmt_time(now_playing.duration))
+        } else {
+            fmt_time(now_playing.position)
+        };
+        let gauge = Gauge::default()
+            .gauge_style(Style::default().fg(Color::Cyan))
+            .ratio(ratio)
+            .label(label);
+        frame.render_widget(gauge, rows[1]);
+
+        // Line 3: transport state + volume + keybinding hints.
+        let vol_pct = (now_playing.volume * 100.0).round() as i32;
+        let state_line = format!(
+            "{}   vol {vol_pct}%   [space] play/pause  [\u{2190}/\u{2192}] seek  [+/-] volume  [n]ext [p]rev  [s]top  [Q] quit+stop",
+            now_playing.status
+        );
+        frame.render_widget(Paragraph::new(state_line).style(theme::muted()), rows[2]);
     }
 }
