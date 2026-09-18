@@ -1,11 +1,11 @@
 mod app;
 mod dbus_client;
+mod library;
 mod lifecycle;
 mod login;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use maraetai_common::auth::AuthParams;
 use maraetai_common::Credentials;
 
 #[derive(Parser)]
@@ -24,8 +24,7 @@ enum Command {
         #[command(subcommand)]
         action: DaemonAction,
     },
-    /// Play a specific song id — for testing the pipeline before library
-    /// browsing/search exist (see the plan doc's Scope: OUT).
+    /// Play a specific song id directly, without opening the TUI.
     Play {
         song_id: String,
         #[arg(long)]
@@ -105,7 +104,7 @@ async fn run_play(
     album: Option<String>,
 ) -> Result<()> {
     let creds = Credentials::load().context("run `maraetai login` first")?;
-    let stream_url = build_stream_url(&creds, &song_id);
+    let stream_url = library::Client::new(creds).stream_url(&song_id);
 
     let connection = lifecycle::ensure_daemon_running().await?;
     let proxy = dbus_client::connect(&connection)
@@ -126,29 +125,11 @@ async fn run_play(
     Ok(())
 }
 
-/// Builds an authenticated `/rest/stream.view` URL for `song_id` — the same
-/// shape every other maraetai client sends, freshly salted per call.
-fn build_stream_url(creds: &Credentials, song_id: &str) -> String {
-    let auth = AuthParams::new(&creds.username, &creds.password);
-    let mut pairs = vec![("id".to_string(), song_id.to_string())];
-    auth.append_to(&mut pairs);
-    pairs.push(("f".to_string(), "json".to_string()));
-
-    let query = pairs
-        .iter()
-        .map(|(k, v)| format!("{k}={}", urlencoding::encode(v)))
-        .collect::<Vec<_>>()
-        .join("&");
-    format!(
-        "{}/rest/stream.view?{query}",
-        creds.server_url.trim_end_matches('/')
-    )
-}
-
 async fn run_tui() -> Result<()> {
+    let creds = Credentials::load().context("run `maraetai login` first")?;
     let connection = lifecycle::ensure_daemon_running().await?;
     let proxy = dbus_client::connect(&connection)
         .await
         .context("connecting to daemon control interface")?;
-    app::run(proxy).await
+    app::run(proxy, creds).await
 }

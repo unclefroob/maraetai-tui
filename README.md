@@ -16,10 +16,10 @@ TUI runs in, so this is split like `mpd`/`ncmpcpp`:
   `com.maraetai.Daemon1` for everything MPRIS doesn't cover (loading a
   specific track, explicit shutdown).
 - **`maraetai`** — the TUI. A thin client: talks to `maraetaid` over D-Bus
-  for playback control, and — once library browsing exists (see Scope: OUT
-  below) — will talk directly to `maraetai-service`'s existing Subsonic API
-  for browsing/search, the same way every other maraetai client already does.
-  It also carries the CLI (`login`, `daemon status`/`stop`, `play <song-id>`).
+  for playback control, and talks directly to `maraetai-service`'s existing
+  Subsonic API for browsing albums and search, the same way every other
+  maraetai client already does. It also carries the CLI (`login`,
+  `daemon status`/`stop`, `play <song-id>`).
 
 ## Not perpetually running by design
 
@@ -62,15 +62,21 @@ iOS's Keychain use) doesn't already do.
 ```sh
 cargo build --workspace
 ./target/debug/maraetai login       # prompts for server URL, username, password
-./target/debug/maraetai             # launches the TUI, auto-spawning maraetaid
+./target/debug/maraetai             # launches the TUI: browse albums, / to search,
+                                     # Enter to play, auto-spawning maraetaid
 ```
+
+In the TUI: arrow keys/`j`/`k` to move, `Enter` to open an album or play a
+song, `/` to search, `Esc`/`Backspace` to go back, `space` to play/pause,
+`s` to stop, `q` to quit (daemon keeps running), `Q` to quit and stop it.
 
 ## Parity with the other maraetai clients
 
 | Feature | iOS/macOS | Android | Web | **TUI** |
 |---|---|---|---|---|
-| Browse albums/artists/playlists | ✅ | ✅ | ✅ | ❌ *(planned — see Scope: OUT)* |
-| Search | ✅ | ✅ | ✅ | ❌ *(planned)* |
+| Browse albums | ✅ | ✅ | ✅ | ✅ |
+| Browse artists/playlists/genres | ✅ | ✅ | ✅ | ❌ *(planned)* |
+| Search | ✅ | ✅ | ✅ | ✅ *(songs only)* |
 | Playback (stream, seek, queue) | ✅ | ✅ | ✅ | ✅ *(single track; queue planned)* |
 | Favourites / playlists edit | ✅ | ✅ | ✅ | ❌ *(planned)* |
 | OS media-key / lock-screen integration | ✅ (native) | ✅ (native) | ❌ | ✅ (MPRIS) |
@@ -79,8 +85,8 @@ cargo build --workspace
 
 ## Scope: OUT (v1)
 
-- No library browsing/search yet — `maraetai play <song-id>` exists for
-  testing the streaming/control pipeline manually in the meantime.
+- No artist/playlist/genre browsing yet — only albums and song search.
+  `maraetai play <song-id>` also exists for direct testing.
 - No queue/playlist management — one track at a time.
 - No systemd/launchd unit shipped by default — spawn-on-demand +
   idle-shutdown is the default experience, not an always-on service (see
