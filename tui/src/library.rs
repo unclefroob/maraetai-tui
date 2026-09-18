@@ -32,6 +32,12 @@ pub struct Playlist {
     pub name: String,
     #[serde(default, rename = "songCount")]
     pub song_count: u32,
+    /// The Subsonic username that owns this playlist. Used to filter
+    /// `getPlaylists` down to just the caller's own — Navidrome's endpoint
+    /// (unlike the Subsonic spec's stated default) also returns other
+    /// users' *public* playlists when no `username` filter is given.
+    #[serde(default)]
+    pub owner: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -130,9 +136,15 @@ impl Client {
         parse(root["artist"]["album"].take())
     }
 
+    /// Only the caller's *own* playlists — Navidrome's `getPlaylists`
+    /// returns other users' public playlists too when called with no
+    /// `username` filter, so this filters client-side by `owner` rather
+    /// than relying on server-side behavior that doesn't match the
+    /// Subsonic spec's own documented default.
     pub async fn playlists(&self) -> Result<Vec<Playlist>> {
         let mut root = self.get_json("rest/getPlaylists.view", &[]).await?;
-        parse(root["playlists"]["playlist"].take())
+        let all: Vec<Playlist> = parse(root["playlists"]["playlist"].take())?;
+        Ok(all.into_iter().filter(|p| p.owner == self.creds.username).collect())
     }
 
     /// Note: Subsonic's `getPlaylist` nests its songs under `entry`, not
@@ -274,6 +286,28 @@ mod tests {
         assert_eq!(songs[0].cover_art.as_deref(), Some("al1"));
         // Missing coverArt on the second song must not be a parse error.
         assert_eq!(songs[1].cover_art, None);
+    }
+
+    #[tokio::test]
+    async fn playlists_filters_out_other_users_public_playlists() {
+        // Navidrome's getPlaylists returns other users' *public* playlists
+        // too when called with no `username` filter — this must be filtered
+        // client-side down to just the caller's own (test_creds uses "alice").
+        let url = respond_once(
+            r#"{"subsonic-response":{"status":"ok","playlists":{"playlist":[
+                {"id":"pl1","name":"My Mix","songCount":5,"owner":"alice"},
+                {"id":"pl2","name":"Bob's Public Mix","songCount":3,"owner":"bob","public":true},
+                {"id":"pl3","name":"Another Alice List","songCount":1,"owner":"alice"}
+            ]}}}"#,
+        )
+        .await;
+
+        let client = Client::new(test_creds(url));
+        let playlists = client.playlists().await.unwrap();
+        assert_eq!(playlists.len(), 2);
+        assert!(playlists.iter().all(|p| p.owner == "alice"));
+        assert_eq!(playlists[0].name, "My Mix");
+        assert_eq!(playlists[1].name, "Another Alice List");
     }
 
     #[tokio::test]
