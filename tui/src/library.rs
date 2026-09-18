@@ -63,6 +63,36 @@ pub struct Song {
     pub duration: f64,
     #[serde(default, rename = "coverArt")]
     pub cover_art: Option<String>,
+    /// File extension as Navidrome reports it (e.g. "flac", "mp3") — used to
+    /// derive the format/lossless display, see [`format_label`].
+    #[serde(default)]
+    pub suffix: String,
+    #[serde(default, rename = "bitRate")]
+    pub bit_rate: Option<u32>,
+}
+
+/// Suffixes for formats that are lossless *as a container* — `m4a`/`mp4`
+/// deliberately excluded: that extension is used for both lossy AAC and
+/// lossless ALAC, and Subsonic doesn't reliably disambiguate which via
+/// `suffix` alone, so it's shown as (potentially) lossy rather than guessed.
+const LOSSLESS_SUFFIXES: &[&str] = &["flac", "alac", "ape", "wav", "wv", "aiff", "aif", "dsf", "dff"];
+
+/// A short display label for a song's format — e.g. `"FLAC"` for a lossless
+/// file, `"MP3 320"` for a lossy one with a known bitrate — plus whether
+/// it's lossless, for styling. Empty suffix (metadata Navidrome didn't send)
+/// yields an empty label rather than a guess.
+pub fn format_label(suffix: &str, bit_rate: Option<u32>) -> (String, bool) {
+    if suffix.is_empty() {
+        return (String::new(), false);
+    }
+    let lossless = LOSSLESS_SUFFIXES.contains(&suffix.to_ascii_lowercase().as_str());
+    let upper = suffix.to_ascii_uppercase();
+    let label = match (lossless, bit_rate) {
+        (true, _) => upper,
+        (false, Some(kbps)) if kbps > 0 => format!("{upper} {kbps}"),
+        (false, _) => upper,
+    };
+    (label, lossless)
 }
 
 pub struct Client {
@@ -339,5 +369,48 @@ mod tests {
         let client = Client::new(test_creds("https://example.com".into()));
         assert_eq!(client.cover_art_url(&None), "");
         assert!(client.cover_art_url(&Some("art1".into())).contains("id=art1"));
+    }
+
+    #[test]
+    fn format_label_marks_flac_lossless_without_bitrate() {
+        let (label, lossless) = format_label("flac", Some(1234));
+        assert_eq!(label, "FLAC");
+        assert!(lossless, "FLAC must be reported lossless");
+    }
+
+    #[test]
+    fn format_label_shows_bitrate_for_lossy_formats() {
+        let (label, lossless) = format_label("mp3", Some(320));
+        assert_eq!(label, "MP3 320");
+        assert!(!lossless);
+    }
+
+    #[test]
+    fn format_label_handles_missing_bitrate() {
+        let (label, lossless) = format_label("ogg", None);
+        assert_eq!(label, "OGG");
+        assert!(!lossless);
+    }
+
+    #[test]
+    fn format_label_treats_m4a_as_lossy_not_a_guess() {
+        // m4a is used for both lossy AAC and lossless ALAC; Subsonic's
+        // `suffix` alone can't disambiguate, so this must not claim lossless.
+        let (label, lossless) = format_label("m4a", Some(256));
+        assert_eq!(label, "M4A 256");
+        assert!(!lossless);
+    }
+
+    #[test]
+    fn format_label_empty_suffix_yields_empty_label() {
+        let (label, lossless) = format_label("", None);
+        assert_eq!(label, "");
+        assert!(!lossless);
+    }
+
+    #[test]
+    fn format_label_is_case_insensitive_for_lossless_detection() {
+        let (_, lossless) = format_label("FLAC", None);
+        assert!(lossless);
     }
 }

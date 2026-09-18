@@ -24,7 +24,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Block, Borders, Cell, Gauge, List, ListItem, ListState, Paragraph, Row, Table, TableState};
 
 use crate::dbus_client::{ControlProxy, QueueEntry};
 use crate::library::{self, Album, Artist, Genre, Playlist, Song};
@@ -539,9 +539,10 @@ impl App<'_> {
                 );
             }
             Screen::SongList { title, songs, selected } => {
-                let rows = songs
-                    .iter()
-                    .map(|s| (s.title.as_str(), s.artist.as_str(), s.album.as_str(), s.duration));
+                let rows = songs.iter().map(|s| {
+                    let (fmt, lossless) = library::format_label(&s.suffix, s.bit_rate);
+                    (s.title.as_str(), s.artist.as_str(), s.album.as_str(), s.duration, fmt, lossless)
+                });
                 self.draw_song_table(
                     frame,
                     chunks[0],
@@ -586,13 +587,18 @@ impl App<'_> {
                 } else {
                     format!(" Search: {query}  [Enter] play from here  [Esc] back ")
                 };
-                let rows = results
-                    .iter()
-                    .map(|s| (s.title.as_str(), s.artist.as_str(), s.album.as_str(), s.duration));
+                let rows = results.iter().map(|s| {
+                    let (fmt, lossless) = library::format_label(&s.suffix, s.bit_rate);
+                    (s.title.as_str(), s.artist.as_str(), s.album.as_str(), s.duration, fmt, lossless)
+                });
                 self.draw_song_table(frame, chunks[0], &title, rows, *selected, &now_playing.title);
             }
             Screen::Queue { tracks, selected } => {
-                let rows = tracks.iter().map(|(t, a, al, d)| (t.as_str(), a.as_str(), al.as_str(), *d));
+                // The daemon's queue doesn't carry format/bitrate yet (see
+                // the plan doc) — shown blank here rather than guessed.
+                let rows = tracks
+                    .iter()
+                    .map(|(t, a, al, d)| (t.as_str(), a.as_str(), al.as_str(), *d, String::new(), false));
                 self.draw_song_table(
                     frame,
                     chunks[0],
@@ -620,34 +626,48 @@ impl App<'_> {
         frame.render_stateful_widget(list, area, &mut state);
     }
 
-    /// Renders a column-aligned track table (Title / Artist / Album / Time),
-    /// cmus-style, with the currently-playing row (matched by title — the
-    /// only stable identifier available client-side) highlighted regardless
-    /// of cursor position.
+    /// Renders a column-aligned track table (Title / Artist / Album / Format
+    /// / Time), cmus-style, with the currently-playing row (matched by
+    /// title — the only stable identifier available client-side)
+    /// highlighted regardless of cursor position. Lossless formats (FLAC,
+    /// ALAC, WAV, ...) are shown in green; lossy ones in the default color.
     fn draw_song_table<'r>(
         &self,
         frame: &mut Frame,
         area: Rect,
         title: &str,
-        rows: impl Iterator<Item = (&'r str, &'r str, &'r str, f64)>,
+        rows: impl Iterator<Item = (&'r str, &'r str, &'r str, f64, String, bool)>,
         selected: usize,
         now_playing_title: &str,
     ) {
         let mut any = false;
         let table_rows: Vec<Row> = rows
-            .map(|(t, artist, album, dur)| {
+            .map(|(t, artist, album, dur, format, lossless)| {
                 any = true;
                 let is_playing = !now_playing_title.is_empty() && t == now_playing_title;
-                let style = if is_playing { theme::now_playing_row() } else { Style::default() };
-                Row::new(vec![t.to_string(), artist.to_string(), album.to_string(), fmt_time(dur)]).style(style)
+                let row_style = if is_playing { theme::now_playing_row() } else { Style::default() };
+                let format_style = if lossless {
+                    Style::default().fg(Color::Green).add_modifier(ratatui::style::Modifier::BOLD)
+                } else {
+                    row_style
+                };
+                Row::new(vec![
+                    Cell::from(t.to_string()),
+                    Cell::from(artist.to_string()),
+                    Cell::from(album.to_string()),
+                    Cell::from(format).style(format_style),
+                    Cell::from(fmt_time(dur)),
+                ])
+                .style(row_style)
             })
             .collect();
 
-        let header = Row::new(vec!["Title", "Artist", "Album", "Time"]).style(theme::header());
+        let header = Row::new(vec!["Title", "Artist", "Album", "Format", "Time"]).style(theme::header());
         let widths = [
-            Constraint::Percentage(40),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
+            Constraint::Percentage(36),
+            Constraint::Percentage(22),
+            Constraint::Percentage(22),
+            Constraint::Length(10),
             Constraint::Length(6),
         ];
         let table = Table::new(table_rows, widths)
