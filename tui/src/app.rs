@@ -336,8 +336,54 @@ fn fmt_time(secs: f64) -> String {
 /// the screen's usual keybind hint — e.g. `" Albums — filter: mez  [Enter]
 /// open  [Esc] back "` versus the plain `" Albums — [Enter] open  [Esc]
 /// back "` when nothing is being filtered.
-fn filter_hint_title(base: &str, filter: &str, hint: &str) -> String {
-    if filter.is_empty() {
+/// Builds a list/table title showing the active filter (if any) and whether
+/// it's currently being typed into. Critically, `editing` shows a cursor
+/// even with an empty `filter` — pressing `/` must be *visibly* confirmed
+/// immediately, not just once the first character lands, otherwise it's
+/// easy to press `/` again thinking the first press didn't register (which
+/// used to type a literal `/` into the query — see `handle_filter_edit`).
+/// Pure key-handling logic behind `handle_filter_edit`, factored out so
+/// it's unit-testable without a real `App` (which needs a live D-Bus
+/// connection to a daemon just to construct). Returns `None` for a key this
+/// mode doesn't handle at all (falls through to normal key handling
+/// unchanged); otherwise `Some((stop_editing, consumed))` — `stop_editing`
+/// ends filter-edit mode, `consumed` says whether the key should *also* be
+/// processed as a normal keybinding on the same press (only `Enter` isn't:
+/// stopping edit mode and immediately activating the selection in one
+/// keypress is what actually fixes the confusion that used to cause a
+/// stray `/` in the query).
+fn apply_filter_key(filter: &mut String, selected: &mut usize, code: KeyCode) -> Option<(bool, bool)> {
+    match code {
+        // Swallowed, not inserted: `/` is the very key that opens
+        // filtering, and an empty filter shows no visible change at all
+        // (see `filter_hint_title`) — so a second press, easy to do before
+        // realizing the first one already worked, must never end up as a
+        // literal `/` in the query.
+        KeyCode::Char('/') => Some((false, true)),
+        KeyCode::Char(c) => {
+            filter.push(c);
+            *selected = 0;
+            Some((false, true))
+        }
+        KeyCode::Backspace => {
+            filter.pop();
+            *selected = 0;
+            Some((false, true))
+        }
+        KeyCode::Esc => {
+            filter.clear();
+            *selected = 0;
+            Some((true, true))
+        }
+        KeyCode::Enter => Some((true, false)),
+        _ => None,
+    }
+}
+
+fn filter_hint_title(base: &str, filter: &str, editing: bool, hint: &str) -> String {
+    if editing {
+        format!(" {base} — filter: {filter}_  [Enter] apply  [Esc] cancel ")
+    } else if filter.is_empty() {
         format!(" {base} — {hint} ")
     } else {
         format!(" {base} — filter: {filter}  {hint} ")
@@ -781,29 +827,13 @@ impl App<'_> {
             | Screen::Queue { filter, selected, .. } => (filter, selected),
             _ => return false,
         };
-        let stop_editing = match code {
-            KeyCode::Char(c) => {
-                filter.push(c);
-                *selected = 0;
-                false
-            }
-            KeyCode::Backspace => {
-                filter.pop();
-                *selected = 0;
-                false
-            }
-            KeyCode::Enter => true,
-            KeyCode::Esc => {
-                filter.clear();
-                *selected = 0;
-                true
-            }
-            _ => return false,
+        let Some((stop_editing, consumed)) = apply_filter_key(filter, selected, code) else {
+            return false;
         };
         if stop_editing {
             self.filter_editing = false;
         }
-        true
+        consumed
     }
 
     /// Indices into the top screen's underlying list that match its current
@@ -1155,7 +1185,7 @@ impl App<'_> {
         match self.top() {
             Screen::AlbumList { title, albums, selected, filter } => {
                 let items = visible.iter().map(|&i| format!("{}  —  {}", albums[i].name, albums[i].artist));
-                self.draw_list(frame, chunks[1], &filter_hint_title(title, filter, "[Enter] open  [Esc] back"), items, *selected);
+                self.draw_list(frame, chunks[1], &filter_hint_title(title, filter, self.filter_editing, "[Enter] open  [Esc] back"), items, *selected);
             }
             Screen::SongList { title, songs, selected, filter } => {
                 let rows = visible.iter().map(|&i| {
@@ -1163,19 +1193,19 @@ impl App<'_> {
                     let (fmt, lossless) = library::format_label(&s.suffix, s.bit_rate);
                     (s.title.as_str(), s.artist.as_str(), s.album.as_str(), s.duration, fmt, lossless, s.is_starred())
                 });
-                let title = filter_hint_title(title, filter, "[Enter] play  [a]dd  [f]avorite  [Esc] back");
+                let title = filter_hint_title(title, filter, self.filter_editing, "[Enter] play  [a]dd  [f]avorite  [Esc] back");
                 self.draw_song_table(frame, chunks[1], &title, rows, *selected, &now_playing.title);
             }
             Screen::ArtistList { artists, selected, filter } => {
                 let items = visible.iter().map(|&i| format!("{}  ({} albums)", artists[i].name, artists[i].album_count));
-                self.draw_list(frame, chunks[1], &filter_hint_title("Artists", filter, "[Enter] open  [Esc] back"), items, *selected);
+                self.draw_list(frame, chunks[1], &filter_hint_title("Artists", filter, self.filter_editing, "[Enter] open  [Esc] back"), items, *selected);
             }
             Screen::PlaylistList { playlists, selected, filter } => {
                 let items = visible.iter().map(|&i| format!("{}  ({} songs)", playlists[i].name, playlists[i].song_count));
                 self.draw_list(
                     frame,
                     chunks[1],
-                    &filter_hint_title("Playlists", filter, "[Enter] open  [Esc] back"),
+                    &filter_hint_title("Playlists", filter, self.filter_editing, "[Enter] open  [Esc] back"),
                     items,
                     *selected,
                 );
@@ -1185,7 +1215,7 @@ impl App<'_> {
                     let g = &genres[i];
                     format!("{}  ({} albums, {} songs)", g.value, g.album_count, g.song_count)
                 });
-                self.draw_list(frame, chunks[1], &filter_hint_title("Genres", filter, "[Enter] open  [Esc] back"), items, *selected);
+                self.draw_list(frame, chunks[1], &filter_hint_title("Genres", filter, self.filter_editing, "[Enter] open  [Esc] back"), items, *selected);
             }
             Screen::Search { query, editing, results, selected } => {
                 let title = if *editing {
@@ -1204,7 +1234,7 @@ impl App<'_> {
                     let (t, a, al, d, fmt, lossless) = &tracks[i];
                     (t.as_str(), a.as_str(), al.as_str(), *d, fmt.clone(), *lossless, false)
                 });
-                let title = filter_hint_title("Queue", filter, "[Enter] jump to track  [Esc] back");
+                let title = filter_hint_title("Queue", filter, self.filter_editing, "[Enter] jump to track  [Esc] back");
                 self.draw_song_table(frame, chunks[1], &title, rows, *selected, &now_playing.title);
             }
             Screen::Lyrics { scroll, follow } => {
@@ -1612,4 +1642,93 @@ fn spectrum_rows(levels: &[u8], width: u16, height: u16) -> Vec<Line<'static>> {
             Line::from(spans)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_second_slash_while_editing_is_swallowed_not_inserted() {
+        let mut filter = String::new();
+        let mut selected = 0;
+        // First `/` is what enters edit mode in the caller — this test
+        // starts from "already editing" (the state that matters) and
+        // checks a `/` reaching this function never ends up in the text.
+        let result = apply_filter_key(&mut filter, &mut selected, KeyCode::Char('/'));
+        assert_eq!(result, Some((false, true)), "must stay in edit mode and consume the key");
+        assert_eq!(filter, "", "a `/` must never be inserted into the filter text");
+    }
+
+    #[test]
+    fn ordinary_characters_are_typed_into_the_filter() {
+        let mut filter = String::from("ab");
+        let mut selected = 3;
+        let result = apply_filter_key(&mut filter, &mut selected, KeyCode::Char('c'));
+        assert_eq!(result, Some((false, true)));
+        assert_eq!(filter, "abc");
+        assert_eq!(selected, 0, "typing must reset the selection to the top of the new filtered view");
+    }
+
+    #[test]
+    fn backspace_removes_the_last_character() {
+        let mut filter = String::from("abc");
+        let mut selected = 1;
+        let result = apply_filter_key(&mut filter, &mut selected, KeyCode::Backspace);
+        assert_eq!(result, Some((false, true)));
+        assert_eq!(filter, "ab");
+        assert_eq!(selected, 0);
+    }
+
+    #[test]
+    fn escape_clears_the_filter_and_stops_editing() {
+        let mut filter = String::from("abc");
+        let mut selected = 2;
+        let result = apply_filter_key(&mut filter, &mut selected, KeyCode::Esc);
+        assert_eq!(result, Some((true, true)));
+        assert_eq!(filter, "");
+        assert_eq!(selected, 0);
+    }
+
+    #[test]
+    fn enter_stops_editing_without_consuming_the_key_or_touching_the_filter() {
+        // Not consumed is the important part: it's what lets the same
+        // Enter press also activate the current selection, in the same
+        // event-loop iteration, instead of needing a second Enter.
+        let mut filter = String::from("abc");
+        let mut selected = 2;
+        let result = apply_filter_key(&mut filter, &mut selected, KeyCode::Enter);
+        assert_eq!(result, Some((true, false)));
+        assert_eq!(filter, "abc", "Enter must not alter the filter text");
+        assert_eq!(selected, 2, "Enter must not alter the selection");
+    }
+
+    #[test]
+    fn navigation_keys_are_not_handled_here() {
+        let mut filter = String::from("abc");
+        let mut selected = 2;
+        assert_eq!(apply_filter_key(&mut filter, &mut selected, KeyCode::Up), None);
+        assert_eq!(apply_filter_key(&mut filter, &mut selected, KeyCode::Down), None);
+        // Unchanged either way.
+        assert_eq!(filter, "abc");
+        assert_eq!(selected, 2);
+    }
+
+    #[test]
+    fn filter_hint_title_shows_a_cursor_while_editing_even_when_empty() {
+        // This is the actual fix for "pressed / and nothing seemed to
+        // happen" — there must be a visible difference the instant editing
+        // starts, before any character has been typed.
+        let editing_empty = filter_hint_title("Albums", "", true, "[Enter] open");
+        let not_editing_empty = filter_hint_title("Albums", "", false, "[Enter] open");
+        assert_ne!(editing_empty, not_editing_empty);
+        assert!(editing_empty.contains("filter:"));
+    }
+
+    #[test]
+    fn filter_hint_title_shows_the_filter_text_after_editing_stops() {
+        let title = filter_hint_title("Albums", "mez", false, "[Enter] open");
+        assert!(title.contains("filter: mez"));
+        assert!(!title.contains('_'), "no cursor once editing has stopped");
+    }
 }
