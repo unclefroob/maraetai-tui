@@ -89,6 +89,14 @@ impl ControlInterface {
         self.playback.append_queue(tracks);
     }
 
+    /// Inserts tracks to play immediately after the current one —
+    /// distinct from `append_queue` (goes to the very end) and
+    /// `play_queue` (replaces the queue) — for the `A` ("play next") key.
+    async fn play_next(&self, tracks: Vec<QueueEntry>) {
+        let tracks = tracks.into_iter().map(to_track_meta).collect();
+        self.playback.play_next(tracks);
+    }
+
     /// The full current queue: (title, artist, album, duration_secs,
     /// format_label, lossless, song_id) per track, in order — for a TUI
     /// "Queue" view. `song_id` trails at the end (added for "save queue as
