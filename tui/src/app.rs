@@ -44,6 +44,10 @@ use crate::library::{self, Album, Artist, Genre, Playlist, Song};
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const SEEK_STEP: f64 = 5.0;
 const VOLUME_STEP: f64 = 0.05;
+/// Total height (including its own border) of the toggleable lyrics panel —
+/// a handful of lines of context around the current one, not a full screen,
+/// since it now shares vertical space with whatever tab is active.
+const LYRICS_PANEL_HEIGHT: u16 = 9;
 
 /// The persistent top-level tabs — always visible, switched with `1`-`6`
 /// (rmpc itself uses configurable keys per tab; fixed number keys are a
@@ -63,15 +67,17 @@ enum Tab {
     Genres,
     Search,
     Queue,
-    Lyrics,
 }
 
 /// Digits `1`-`9` jump directly to a tab; `[`/`]` cycle through all of them.
-/// With exactly 8 tabs every one of them already has a digit of its own —
+/// With exactly 7 tabs every one of them already has a digit of its own —
 /// `[`/`]` are just a nice-to-have alternative, not load-bearing the way
-/// they were when there were more tabs than digits.
-const TABS: [Tab; 8] =
-    [Tab::Home, Tab::Playlists, Tab::Albums, Tab::Artists, Tab::Genres, Tab::Search, Tab::Queue, Tab::Lyrics];
+/// they were when there were more tabs than digits. Lyrics used to be one
+/// of these tabs; it's now a toggleable panel instead (see `App::lyrics_open`)
+/// since it only ever makes sense while something is playing, unlike every
+/// tab here which is always browsable.
+const TABS: [Tab; 7] =
+    [Tab::Home, Tab::Playlists, Tab::Albums, Tab::Artists, Tab::Genres, Tab::Search, Tab::Queue];
 
 impl Tab {
     fn label(self) -> &'static str {
@@ -83,7 +89,6 @@ impl Tab {
             Tab::Genres => "Genres",
             Tab::Search => "Search",
             Tab::Queue => "Queue",
-            Tab::Lyrics => "Lyrics",
         }
     }
 }
@@ -220,18 +225,6 @@ enum Screen {
         selected: usize,
         filter: String,
     },
-    /// Lyrics for whatever's currently playing. The actual lines (and the
-    /// fetch that produced them) live on `App` (`lyrics`,
-    /// `current_lyrics_song_id`) rather than here, keyed by song id and
-    /// refreshed automatically as the track changes — this variant only
-    /// carries the view's own scroll state. `follow`: auto-scroll to keep
-    /// the currently-sung line in view (for time-synced lyrics); becomes
-    /// `false` as soon as the user manually scrolls, and `true` again on
-    /// `Enter` or a track change.
-    Lyrics {
-        scroll: usize,
-        follow: bool,
-    },
     /// The Home dashboard — short previews of all four native lists.
     /// `section`/`selected` together are the cursor: `selected` is a row
     /// within `sections[section].songs`. Moving up past row 0 or down past
@@ -308,11 +301,17 @@ struct App<'a> {
     current_lyrics_song_id: Option<String>,
     /// `None` while fetching or when there's nothing to show; `Some(vec![])`
     /// specifically means "fetched successfully, this track really has no
-    /// lyrics" — distinct from "still loading", so the Lyrics tab can show
+    /// lyrics" — distinct from "still loading", so the lyrics panel can show
     /// the right message for each.
     lyrics: Option<Vec<library::LyricLine>>,
     lyrics_tx: mpsc::UnboundedSender<LyricsFetched>,
     lyrics_rx: mpsc::UnboundedReceiver<LyricsFetched>,
+    /// Whether the lyrics panel is toggled on (`l`) — rendered as a strip
+    /// between the active tab's content and the now-playing bar, but only
+    /// while there's actually a current track (see `draw`). Independent of
+    /// which tab is active: toggling it doesn't change or interrupt
+    /// whatever's on screen underneath.
+    lyrics_open: bool,
     /// Whether `/` on the current screen is capturing keystrokes into its
     /// `filter` field. A single App-level flag, not one per screen, since
     /// only the top of the stack can ever be being edited.
@@ -350,6 +349,7 @@ pub async fn run(proxy: ControlProxy<'_>, creds: maraetai_common::Credentials) -
         lyrics: None,
         lyrics_tx,
         lyrics_rx,
+        lyrics_open: false,
         filter_editing: false,
         show_help: false,
     };
@@ -545,7 +545,7 @@ impl App<'_> {
                 // screen that has one, rather than always jumping to the
                 // universal Search tab — that's now reserved for screens
                 // with no local list to filter (Search itself restarts a
-                // fresh query; Lyrics has nothing to filter).
+                // fresh query; Home has its own dedicated navigation).
                 KeyCode::Char('/') => {
                     let filterable = matches!(
                         self.top(),
@@ -565,6 +565,11 @@ impl App<'_> {
                 KeyCode::Char('a') => self.append_selection().await,
                 KeyCode::Char('f') => self.toggle_star().await,
                 KeyCode::Char('e') => self.expand_home_section(terminal).await,
+                // Toggles the lyrics panel; it only actually renders while
+                // there's a current track (see `draw`), but the flag itself
+                // flips regardless, so it's already open the next time
+                // something starts playing.
+                KeyCode::Char('l') => self.lyrics_open = !self.lyrics_open,
                 KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
                 KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
                 KeyCode::Enter => self.activate_selection(terminal).await,
@@ -688,10 +693,9 @@ impl App<'_> {
 
     /// Same pattern as `update_art`, keyed by song id instead of art URL:
     /// kicks off a background lyrics fetch when the current track changes,
-    /// and drains any completed fetch into `self.lyrics`. Also resets the
-    /// Lyrics screen's scroll/follow state, if it's the active screen, so a
-    /// new track always starts reading from the top rather than wherever
-    /// the previous track's lyrics happened to be scrolled to.
+    /// and drains any completed fetch into `self.lyrics`. The panel always
+    /// auto-follows the current line (see `draw_lyrics_panel`), so there's
+    /// no separate scroll state here to reset on a track change.
     fn update_lyrics(&mut self, now_playing: &NowPlaying) {
         let new_id = (!now_playing.song_id.is_empty()).then(|| now_playing.song_id.clone());
         if new_id != self.current_lyrics_song_id {
@@ -706,10 +710,6 @@ impl App<'_> {
                     let lines = client.lyrics(&id, &artist, &title).await;
                     let _ = tx.send(LyricsFetched { song_id: id, lines });
                 });
-            }
-            if let Some(Screen::Lyrics { scroll, follow }) = self.stack.first_mut() {
-                *scroll = 0;
-                *follow = true;
             }
         }
         while let Ok(fetched) = self.lyrics_rx.try_recv() {
@@ -811,13 +811,6 @@ impl App<'_> {
                     }
                 }
             }
-            // No fetch here: lyrics are fetched by `update_lyrics` as soon
-            // as a track starts playing, independent of whether this tab
-            // has ever been visited, so by the time the user switches to it
-            // the fetch is usually already underway or done.
-            Tab::Lyrics => {
-                self.stack.push(Screen::Lyrics { scroll: 0, follow: true });
-            }
         }
     }
 
@@ -877,7 +870,7 @@ impl App<'_> {
     /// current screen's own list live; `Enter` stops capturing keystrokes
     /// but keeps the filter active; `Esc` clears it and stops. Only the six
     /// screens with a `filter` field respond; anything else (Search, which
-    /// has its own query mechanism, or Lyrics) leaves this a no-op.
+    /// has its own query mechanism, or Home) leaves this a no-op.
     fn handle_filter_edit(&mut self, code: KeyCode) -> bool {
         let Some(screen) = self.stack.last_mut() else { return false };
         let (filter, selected) = match screen {
@@ -938,23 +931,15 @@ impl App<'_> {
                 .map(|(i, _)| i)
                 .collect(),
             Screen::Search { results, .. } => (0..results.len()).collect(),
-            // Neither filters: Home has its own dedicated cursor/navigation
-            // (see `home_move_selection`), and Lyrics isn't a list at all.
-            Screen::Lyrics { .. } | Screen::Home { .. } => Vec::new(),
+            // Home has its own dedicated cursor/navigation instead (see
+            // `home_move_selection`).
+            Screen::Home { .. } => Vec::new(),
         }
     }
 
     fn move_selection(&mut self, delta: i32) {
         match self.stack.last_mut() {
             None => return,
-            // Lyrics scrolls a line count, not a wrapping list selection —
-            // and manually scrolling disengages auto-follow, same as most
-            // lyrics views (Enter re-engages it, see `activate_selection`).
-            Some(Screen::Lyrics { scroll, follow }) => {
-                *follow = false;
-                *scroll = (*scroll as i32 + delta).max(0) as usize;
-                return;
-            }
             Some(Screen::Search { selected, results, editing, .. }) => {
                 if *editing || results.is_empty() {
                     return;
@@ -988,10 +973,6 @@ impl App<'_> {
     }
 
     async fn activate_selection(&mut self, terminal: &mut ratatui::DefaultTerminal) {
-        if let Some(Screen::Lyrics { follow, .. }) = self.stack.last_mut() {
-            *follow = true;
-            return;
-        }
         if let Screen::Search { results, selected, editing, .. } = self.top() {
             if !*editing && !results.is_empty() {
                 self.play_from(results.clone(), *selected).await;
@@ -1059,9 +1040,9 @@ impl App<'_> {
                     }
                 }
             }
-            // Handled above (Search's own indexing; Lyrics re-engages
-            // follow; Home plays from its capped preview).
-            Screen::Search { .. } | Screen::Lyrics { .. } | Screen::Home { .. } => {}
+            // Handled above (Search's own indexing; Home plays from its
+            // capped preview).
+            Screen::Search { .. } | Screen::Home { .. } => {}
         }
     }
 
@@ -1297,16 +1278,27 @@ impl App<'_> {
         // title/gauge/spectrum filling the rest of that height beside it)
         // + 1 (full-width state line) — see `draw_status_bar`.
         let now_playing_height = art::HEIGHT + 1 + 2;
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(3), Constraint::Length(now_playing_height)])
-            .split(frame.area());
+        // The lyrics panel (`l`) sits between the active tab's content and
+        // the now-playing bar — but only while there's actually a current
+        // track, so toggling it on with nothing playing doesn't leave an
+        // empty strip claiming space for no reason.
+        let show_lyrics = self.lyrics_open && !now_playing.song_id.is_empty();
+        let mut constraints = vec![Constraint::Length(3), Constraint::Min(3)];
+        if show_lyrics {
+            constraints.push(Constraint::Length(LYRICS_PANEL_HEIGHT));
+        }
+        constraints.push(Constraint::Length(now_playing_height));
+        let chunks = Layout::default().direction(Direction::Vertical).constraints(constraints).split(frame.area());
+        let now_playing_chunk = chunks[chunks.len() - 1];
 
         self.draw_tab_bar(frame, chunks[0]);
 
         if self.show_help {
             self.draw_help(frame, chunks[1]);
-            self.draw_status_bar(frame, chunks[2], now_playing);
+            if show_lyrics {
+                self.draw_lyrics_panel(frame, chunks[2], now_playing);
+            }
+            self.draw_status_bar(frame, now_playing_chunk, now_playing);
             return;
         }
 
@@ -1366,15 +1358,15 @@ impl App<'_> {
                 let title = filter_hint_title("Queue", filter, self.filter_editing, "[Enter] jump to track  [Esc] back");
                 self.draw_song_table(frame, chunks[1], &title, rows, *selected, &now_playing.title);
             }
-            Screen::Lyrics { scroll, follow } => {
-                self.draw_lyrics(frame, chunks[1], *scroll, *follow, now_playing);
-            }
             Screen::Home { sections, section, selected } => {
                 self.draw_home(frame, chunks[1], sections, *section, *selected);
             }
         }
 
-        self.draw_status_bar(frame, chunks[2], now_playing);
+        if show_lyrics {
+            self.draw_lyrics_panel(frame, chunks[2], now_playing);
+        }
+        self.draw_status_bar(frame, now_playing_chunk, now_playing);
     }
 
     /// A full-screen keybind reference, overlaying the content area (the
@@ -1382,12 +1374,13 @@ impl App<'_> {
     /// closed by any key.
     fn draw_help(&self, frame: &mut Frame, area: Rect) {
         const BINDINGS: &[(&str, &str)] = &[
-            ("1-8  [ ]", "switch / cycle tabs"),
+            ("1-7  [ ]", "switch / cycle tabs"),
             ("Up/k Down/j", "move selection"),
             ("Enter", "open / play from here"),
             ("a", "add to queue (don't replace it)"),
             ("f", "toggle favorite on the selected song"),
             ("e", "expand a Home section into its full list"),
+            ("l", "toggle the lyrics panel (while something's playing)"),
             ("/", "filter this list (Esc clears it)"),
             ("Esc / Backspace", "clear filter, then back"),
             ("space", "play / pause"),
@@ -1556,17 +1549,17 @@ impl App<'_> {
         }
     }
 
-    /// Renders whatever's in `self.lyrics` for the current track. Time-synced
-    /// lyrics highlight the line matching `now_playing.position` and, while
-    /// `follow` is on, keep it a third of the way down the visible area
-    /// (auto-scrolling as playback advances); unsynced lyrics are just a
-    /// static block the user scrolls manually. `follow` scroll is computed
-    /// fresh every frame from the live position rather than written back
-    /// into the screen's own `scroll` field, since it's meaningless the
-    /// moment the user takes over with a manual scroll anyway.
-    fn draw_lyrics(&self, frame: &mut Frame, area: Rect, scroll: usize, follow: bool, now_playing: &NowPlaying) {
-        let hint = if follow { "[Up/Down] scroll" } else { "[Up/Down] scroll  [Enter] follow" };
-        let block = rounded_block(format!(" Lyrics — {hint} "));
+    /// Renders whatever's in `self.lyrics` for the current track, in the
+    /// toggleable panel between the active tab's content and the
+    /// now-playing bar (see `draw`, `App::lyrics_open`). Time-synced lyrics
+    /// keep the line matching `now_playing.position` a third of the way
+    /// down the panel, auto-scrolling as playback advances; unsynced
+    /// lyrics just render from the top, since a fixed-height panel with no
+    /// synced cursor has no meaningful position to scroll to. There's no
+    /// manual scroll here — it's a compact glance-at panel, not a
+    /// dedicated reading view.
+    fn draw_lyrics_panel(&self, frame: &mut Frame, area: Rect, now_playing: &NowPlaying) {
+        let block = rounded_block(" Lyrics — [l] hide ");
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -1583,13 +1576,9 @@ impl App<'_> {
         let position_ms = (now_playing.position * 1000.0).round() as i64;
         let active_index = lines.iter().rposition(|l| l.start_ms.is_some_and(|start| start <= position_ms));
 
-        let effective_scroll = if follow {
-            match active_index {
-                Some(i) => i.saturating_sub((inner.height as usize) / 3),
-                None => 0,
-            }
-        } else {
-            scroll
+        let effective_scroll = match active_index {
+            Some(i) => i.saturating_sub((inner.height as usize) / 3),
+            None => 0,
         };
         let effective_scroll = effective_scroll.min(lines.len().saturating_sub(1)) as u16;
 
