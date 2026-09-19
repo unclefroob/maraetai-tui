@@ -8,6 +8,7 @@ mod visualizer;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use maraetai_common::{Config, Credentials, dbus};
 use mpris_server::{PlayerInterface, Property, Server, Signal, Time};
 use tokio::sync::Notify;
@@ -17,11 +18,28 @@ use control::ControlInterface;
 use mpris::MprisPlayer;
 use playback::Event;
 
+#[derive(Parser)]
+#[command(name = "maraetaid")]
+struct Cli {
+    /// Lists available audio output devices and exits — use the printed
+    /// name as `output_device` in the config file. Safe to run even while
+    /// a daemon is already active: this never touches the single-instance
+    /// lock or starts playback.
+    #[arg(long)]
+    list_devices: bool,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+
+    let cli = Cli::parse();
+    if cli.list_devices {
+        playback::list_output_devices();
+        return Ok(());
+    }
 
     let _instance_guard = lifecycle::acquire_single_instance_lock()
         .context("could not start maraetaid — is another instance already running?")?;
@@ -31,9 +49,12 @@ async fn main() -> Result<()> {
     // before `maraetai login` has been run, rather than crash-loop on a
     // fresh install. The idle timeout still applies either way — falling
     // back to Config::idle_timeout's built-in default when unconfigured.
-    let idle_timeout = Config::load().map(|c| c.idle_timeout()).unwrap_or_else(|_| {
-        std::time::Duration::from_secs(maraetai_common::config::DEFAULT_IDLE_TIMEOUT_SECS)
-    });
+    let config = Config::load().ok();
+    let idle_timeout = config
+        .as_ref()
+        .map(|c| c.idle_timeout())
+        .unwrap_or_else(|| std::time::Duration::from_secs(maraetai_common::config::DEFAULT_IDLE_TIMEOUT_SECS));
+    let output_device = config.and_then(|c| c.output_device);
     let credentials = match Credentials::load() {
         Ok(creds) => {
             tracing::info!(server = %creds.server_url, user = %creds.username, "credentials loaded");
@@ -46,7 +67,7 @@ async fn main() -> Result<()> {
     };
 
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
-    let playback = playback::spawn(event_tx, credentials);
+    let playback = playback::spawn(event_tx, credentials, output_device);
     let shutdown = Arc::new(Notify::new());
 
     let mpris_server = Arc::new(

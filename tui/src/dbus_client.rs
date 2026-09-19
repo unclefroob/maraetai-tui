@@ -9,9 +9,10 @@ use zbus::Connection;
 use zbus::proxy;
 
 /// One queue entry: (stream_url, title, artist, album, art_url,
-/// duration_secs, format_label, lossless, song_id) — must match
-/// `daemon::control::QueueEntry` exactly.
-pub type QueueEntry = (String, String, String, String, String, f64, String, bool, String);
+/// duration_secs, format_label, lossless, song_id, replay_gain_db) — must
+/// match `daemon::control::QueueEntry` exactly, `f64` (not `Option<f64>`,
+/// which zvariant can't encode over classic D-Bus) included.
+pub type QueueEntry = (String, String, String, String, String, f64, String, bool, String, f64);
 
 #[proxy(
     interface = "com.maraetai.Daemon1",

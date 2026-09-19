@@ -14,13 +14,23 @@ use zbus::interface;
 use crate::playback::{PlaybackHandle, Status, TrackMeta};
 
 /// One queue entry as it crosses D-Bus: (stream_url, title, artist, album,
-/// art_url, duration_secs, format_label, lossless, song_id). A plain tuple
-/// rather than a named struct because zbus/zvariant encode it identically
-/// either way, and a tuple needs no extra type wiring on either side of the
-/// connection. `song_id` (added for scrobbling/lyrics) trails at the end
-/// rather than being inserted among the original fields, so it's obvious at
-/// every call site which positional value is the new one.
-pub type QueueEntry = (String, String, String, String, String, f64, String, bool, String);
+/// art_url, duration_secs, format_label, lossless, song_id,
+/// replay_gain_db). A plain tuple rather than a named struct because
+/// zbus/zvariant encode it identically either way, and a tuple needs no
+/// extra type wiring on either side of the connection. Each field added
+/// after the original set (`song_id` for scrobbling/lyrics,
+/// `replay_gain_db` for ReplayGain) trails at the end rather than being
+/// inserted among the earlier ones, so it's obvious at every call site
+/// which positional value is the newer one.
+///
+/// `replay_gain_db` is a plain `f64`, not `Option<f64>` — zvariant (as
+/// pulled in here) has no `Type` impl for `Option` over the classic D-Bus
+/// wire format (only GVariant's "maybe" type supports that, which this
+/// isn't using). `0.0` doubles as "no ReplayGain data": it's also exactly
+/// what a real 0 dB tag means, so the two cases are indistinguishable in
+/// their effect on playback anyway (both mean "no adjustment") — see
+/// `replay_gain_scale`.
+pub type QueueEntry = (String, String, String, String, String, f64, String, bool, String, f64);
 
 pub struct ControlInterface {
     playback: PlaybackHandle,
@@ -39,7 +49,7 @@ impl ControlInterface {
 }
 
 fn to_track_meta(entry: QueueEntry) -> TrackMeta {
-    let (stream_url, title, artist, album, art_url, duration_secs, format_label, lossless, song_id) = entry;
+    let (stream_url, title, artist, album, art_url, duration_secs, format_label, lossless, song_id, replay_gain_db) = entry;
     TrackMeta {
         stream_url,
         song_id,
@@ -50,6 +60,7 @@ fn to_track_meta(entry: QueueEntry) -> TrackMeta {
         duration: (duration_secs > 0.0).then(|| Duration::from_secs_f64(duration_secs)),
         format_label,
         lossless,
+        replay_gain_db,
     }
 }
 
