@@ -75,7 +75,19 @@ async fn run_daemon_action(action: DaemonAction) -> Result<()> {
     match action {
         DaemonAction::Status => match proxy {
             Ok(proxy) => match proxy.status().await {
-                Ok((status, title, artist, _album, position, duration, queue_index, queue_len, _volume)) => {
+                Ok((
+                    status,
+                    title,
+                    artist,
+                    _album,
+                    position,
+                    duration,
+                    queue_index,
+                    queue_len,
+                    _volume,
+                    format_label,
+                    _lossless,
+                )) => {
                     if title.is_empty() {
                         println!("daemon running — {status}");
                     } else {
@@ -85,14 +97,15 @@ async fn run_daemon_action(action: DaemonAction) -> Result<()> {
                         } else {
                             format!("{position:.1}s")
                         };
+                        let fmt = if format_label.is_empty() { String::new() } else { format!(" [{format_label}]") };
                         if queue_len > 0 {
                             println!(
-                                "daemon running — {status}: {title}{by} ({dur}) [{} of {}]",
+                                "daemon running — {status}: {title}{by} ({dur}){fmt} [{} of {}]",
                                 queue_index + 1,
                                 queue_len
                             );
                         } else {
-                            println!("daemon running — {status}: {title}{by} ({dur})");
+                            println!("daemon running — {status}: {title}{by} ({dur}){fmt}");
                         }
                     }
                 }
@@ -131,6 +144,8 @@ async fn run_play(
         album.unwrap_or_default(),
         String::new(),
         0.0,
+        String::new(), // format unknown — this command only has a raw song id, no library metadata
+        false,
     );
     proxy
         .play_queue(vec![track], 0)

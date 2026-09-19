@@ -18,10 +18,11 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
+use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::range_reader::RangeReader;
+use crate::visualizer::{self, SpectrumAnalyzer, VisualizerTap};
 
 /// How often the engine polls its own `Sink` for position/end-of-track while
 /// idle-waiting on the command channel. Small enough that MPRIS `Seeked`
@@ -54,6 +55,13 @@ pub struct TrackMeta {
     /// HTTP response, since the engine reports playback *position*, not a
     /// duration derived from decoding.
     pub duration: Option<Duration>,
+    /// A pre-formatted display label (e.g. "FLAC", "MP3 320") and whether
+    /// it's lossless — computed client-side (see the TUI's
+    /// `library::format_label`, the single source of truth for the
+    /// format/lossless rules) and carried through as an opaque label rather
+    /// than duplicating that logic here.
+    pub format_label: String,
+    pub lossless: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +79,11 @@ pub struct Snapshot {
     /// snapshot only when the queue actually changes (`PlayQueue`), not on
     /// every poll tick, so this doesn't add per-tick cost.
     pub queue: Vec<TrackMeta>,
+    /// Current spectrum bar levels (0..=`visualizer::MAX_LEVEL` each),
+    /// recomputed from real decoded audio every poll tick — see
+    /// `visualizer.rs`. All-zero while stopped/paused or right after a
+    /// track/seek change (not yet enough buffered samples).
+    pub spectrum: [u8; visualizer::BARS],
 }
 
 impl Snapshot {
@@ -89,6 +102,7 @@ impl Default for Snapshot {
             queue_index: 0,
             queue_len: 0,
             queue: Vec::new(),
+            spectrum: [0; visualizer::BARS],
         }
     }
 }
@@ -234,6 +248,12 @@ struct EngineState {
     http: reqwest::blocking::Client,
     queue: Vec<TrackMeta>,
     index: usize,
+    analyzer: SpectrumAnalyzer,
+    sample_ring: Arc<visualizer::SampleRing>,
+    /// Channels/sample-rate of whatever's currently loaded — captured from
+    /// the decoder at load time (needed for the FFT's frequency-bucket math,
+    /// and no longer queryable once the decoder is consumed into the sink).
+    current_format: Option<(u16, u32)>,
 }
 
 fn run_engine(cmd_rx: Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>, events: UnboundedSender<Event>) {
@@ -245,6 +265,7 @@ fn run_engine(cmd_rx: Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>, events:
             return;
         }
     };
+    let (analyzer, sample_ring) = SpectrumAnalyzer::new();
     let mut state = EngineState {
         _stream: stream,
         stream_handle,
@@ -252,6 +273,9 @@ fn run_engine(cmd_rx: Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>, events:
         http: reqwest::blocking::Client::new(),
         queue: Vec::new(),
         index: 0,
+        analyzer,
+        sample_ring,
+        current_format: None,
     };
 
     loop {
@@ -304,6 +328,7 @@ fn run_engine(cmd_rx: Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>, events:
                 if let Some(sink) = state.sink.take() {
                     sink.stop();
                 }
+                snapshot.lock().expect("poisoned").spectrum = [0; visualizer::BARS];
                 set_status(&snapshot, &events, Status::Stopped);
             }
             Ok(Command::Seek(pos)) => {
@@ -369,6 +394,12 @@ fn start_playback_at(
         }
     };
 
+    // Captured before the decoder is consumed into the tap/sink — needed by
+    // the visualizer's FFT frequency-bucket math on every poll tick.
+    state.current_format = Some((decoder.channels(), decoder.sample_rate()));
+    state.analyzer.reset();
+    let tapped = VisualizerTap::new(decoder, Arc::clone(&state.sample_ring));
+
     let sink = match Sink::try_new(&state.stream_handle) {
         Ok(s) => s,
         Err(e) => {
@@ -377,7 +408,7 @@ fn start_playback_at(
             return;
         }
     };
-    sink.append(decoder);
+    sink.append(tapped);
     {
         let mut snap = snapshot.lock().expect("poisoned");
         snap.status = Status::Playing;
@@ -401,11 +432,25 @@ fn poll_progress(state: &mut EngineState, snapshot: &Arc<Mutex<Snapshot>>, event
             let next = state.index + 1;
             start_playback_at(state, snapshot, events, next);
         } else {
-            snapshot.lock().expect("poisoned").status = Status::Stopped;
+            let mut snap = snapshot.lock().expect("poisoned");
+            snap.status = Status::Stopped;
+            snap.spectrum = [0; visualizer::BARS];
+            drop(snap);
             let _ = events.send(Event::QueueEnded);
             let _ = events.send(Event::StatusChanged(Status::Stopped));
         }
         return;
+    }
+
+    // Only recompute the spectrum while actually producing new audio —
+    // while paused, the last frame is simply left in place (a frozen
+    // visualizer, matching the frozen position), not recomputed from a ring
+    // buffer that isn't receiving new samples anyway.
+    if currently_playing {
+        if let Some((channels, sample_rate)) = state.current_format {
+            let spectrum = state.analyzer.compute(channels, sample_rate);
+            snapshot.lock().expect("poisoned").spectrum = spectrum;
+        }
     }
 
     if let Some(sink) = &state.sink {

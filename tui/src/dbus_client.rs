@@ -9,8 +9,9 @@ use zbus::Connection;
 use zbus::proxy;
 
 /// One queue entry: (stream_url, title, artist, album, art_url,
-/// duration_secs) — must match `daemon::control::QueueEntry` exactly.
-pub type QueueEntry = (String, String, String, String, String, f64);
+/// duration_secs, format_label, lossless) — must match
+/// `daemon::control::QueueEntry` exactly.
+pub type QueueEntry = (String, String, String, String, String, f64, String, bool);
 
 #[proxy(
     interface = "com.maraetai.Daemon1",
@@ -20,7 +21,9 @@ pub type QueueEntry = (String, String, String, String, String, f64);
 pub trait Control {
     async fn play_queue(&self, tracks: Vec<QueueEntry>, start_index: u32) -> zbus::Result<()>;
     async fn play_at(&self, index: u32) -> zbus::Result<()>;
-    async fn queue(&self) -> zbus::Result<Vec<(String, String, String, f64)>>;
+    #[allow(clippy::type_complexity)]
+    async fn queue(&self) -> zbus::Result<Vec<(String, String, String, f64, String, bool)>>;
+    async fn spectrum(&self) -> zbus::Result<Vec<u8>>;
     async fn next(&self) -> zbus::Result<()>;
     async fn previous(&self) -> zbus::Result<()>;
     async fn pause(&self) -> zbus::Result<()>;
@@ -29,7 +32,7 @@ pub trait Control {
     async fn seek_to(&self, position_secs: f64) -> zbus::Result<()>;
     async fn set_volume(&self, volume: f64) -> zbus::Result<()>;
     #[allow(clippy::type_complexity)]
-    async fn status(&self) -> zbus::Result<(String, String, String, String, f64, f64, u32, u32, f64)>;
+    async fn status(&self) -> zbus::Result<(String, String, String, String, f64, f64, u32, u32, f64, String, bool)>;
     async fn quit(&self) -> zbus::Result<()>;
 }
 

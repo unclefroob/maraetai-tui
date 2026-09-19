@@ -14,10 +14,11 @@ use zbus::interface;
 use crate::playback::{PlaybackHandle, Status, TrackMeta};
 
 /// One queue entry as it crosses D-Bus: (stream_url, title, artist, album,
-/// art_url, duration_secs). A plain tuple rather than a named struct because
-/// zbus/zvariant encode it identically either way (`a(sssssd)`), and a tuple
-/// needs no extra type wiring on either side of the connection.
-pub type QueueEntry = (String, String, String, String, String, f64);
+/// art_url, duration_secs, format_label, lossless). A plain tuple rather
+/// than a named struct because zbus/zvariant encode it identically either
+/// way (`a(sssssdsb)`), and a tuple needs no extra type wiring on either
+/// side of the connection.
+pub type QueueEntry = (String, String, String, String, String, f64, String, bool);
 
 pub struct ControlInterface {
     playback: PlaybackHandle,
@@ -36,7 +37,7 @@ impl ControlInterface {
 }
 
 fn to_track_meta(entry: QueueEntry) -> TrackMeta {
-    let (stream_url, title, artist, album, art_url, duration_secs) = entry;
+    let (stream_url, title, artist, album, art_url, duration_secs, format_label, lossless) = entry;
     TrackMeta {
         stream_url,
         title,
@@ -44,6 +45,8 @@ fn to_track_meta(entry: QueueEntry) -> TrackMeta {
         album,
         art_url: (!art_url.is_empty()).then_some(art_url),
         duration: (duration_secs > 0.0).then(|| Duration::from_secs_f64(duration_secs)),
+        format_label,
+        lossless,
     }
 }
 
@@ -64,17 +67,34 @@ impl ControlInterface {
         self.playback.play_at(index as usize);
     }
 
-    /// The full current queue: (title, artist, album, duration_secs) per
-    /// track, in order — for a TUI "Queue" view. Not a property (like
-    /// MPRIS's `Metadata`) since it's a list, not a single value, and this
-    /// project doesn't implement MPRIS's TrackList interface.
-    async fn queue(&self) -> Vec<(String, String, String, f64)> {
+    /// The full current queue: (title, artist, album, duration_secs,
+    /// format_label, lossless) per track, in order — for a TUI "Queue"
+    /// view. Not a property (like MPRIS's `Metadata`) since it's a list,
+    /// not a single value, and this project doesn't implement MPRIS's
+    /// TrackList interface.
+    #[allow(clippy::type_complexity)]
+    async fn queue(&self) -> Vec<(String, String, String, f64, String, bool)> {
         self.playback
             .snapshot()
             .queue
             .into_iter()
-            .map(|t| (t.title, t.artist, t.album, t.duration.map(|d| d.as_secs_f64()).unwrap_or(0.0)))
+            .map(|t| {
+                (
+                    t.title,
+                    t.artist,
+                    t.album,
+                    t.duration.map(|d| d.as_secs_f64()).unwrap_or(0.0),
+                    t.format_label,
+                    t.lossless,
+                )
+            })
             .collect()
+    }
+
+    /// Current spectrum bar levels, `0..=7` each (see `visualizer.rs`) — for
+    /// the TUI's now-playing visualizer. All-zero while nothing is playing.
+    async fn spectrum(&self) -> Vec<u8> {
+        self.playback.snapshot().spectrum.to_vec()
     }
 
     /// Also exposed here (identical to MPRIS's own `Next`) purely so the TUI
@@ -115,22 +135,30 @@ impl ControlInterface {
     /// A compact status summary for `maraetai daemon status` and the TUI's
     /// now-playing bar: playback status, current track (title, artist,
     /// album), position/duration in seconds (duration 0 if unknown),
-    /// (queue index, queue length), and volume (0.0-1.0). Kept as a plain
-    /// method (not properties) since it's a point-in-time snapshot read by a
-    /// one-shot CLI command or a polling loop, not something a D-Bus client
-    /// watches for changes — that's what MPRIS's properties (which do emit
-    /// `PropertiesChanged`) are for.
+    /// (queue index, queue length), volume (0.0-1.0), and format
+    /// (format_label, lossless). Kept as a plain method (not properties)
+    /// since it's a point-in-time snapshot read by a one-shot CLI command or
+    /// a polling loop, not something a D-Bus client watches for changes —
+    /// that's what MPRIS's properties (which do emit `PropertiesChanged`)
+    /// are for.
     #[allow(clippy::type_complexity)]
-    async fn status(&self) -> (String, String, String, String, f64, f64, u32, u32, f64) {
+    async fn status(&self) -> (String, String, String, String, f64, f64, u32, u32, f64, String, bool) {
         let snap = self.playback.snapshot();
         let status = match snap.status {
             Status::Playing => "playing",
             Status::Paused => "paused",
             Status::Stopped => "stopped",
         };
-        let (title, artist, album, duration) = match snap.track {
-            Some(t) => (t.title, t.artist, t.album, t.duration.map(|d| d.as_secs_f64()).unwrap_or(0.0)),
-            None => (String::new(), String::new(), String::new(), 0.0),
+        let (title, artist, album, duration, format_label, lossless) = match snap.track {
+            Some(t) => (
+                t.title,
+                t.artist,
+                t.album,
+                t.duration.map(|d| d.as_secs_f64()).unwrap_or(0.0),
+                t.format_label,
+                t.lossless,
+            ),
+            None => (String::new(), String::new(), String::new(), 0.0, String::new(), false),
         };
         (
             status.to_string(),
@@ -142,6 +170,8 @@ impl ControlInterface {
             snap.queue_index as u32,
             snap.queue_len as u32,
             snap.volume as f64,
+            format_label,
+            lossless,
         )
     }
 

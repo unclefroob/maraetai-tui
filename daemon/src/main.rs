@@ -3,6 +3,7 @@ mod lifecycle;
 mod mpris;
 mod playback;
 mod range_reader;
+mod visualizer;
 
 use std::sync::Arc;
 

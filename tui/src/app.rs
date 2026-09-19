@@ -59,9 +59,9 @@ mod theme {
     }
 }
 
-/// One entry in the "Queue" view — title/artist/album/duration, as returned
-/// by the daemon's `Queue()` method.
-type QueueRow = (String, String, String, f64);
+/// One entry in the "Queue" view — title/artist/album/duration/format_label/
+/// lossless, as returned by the daemon's `Queue()` method.
+type QueueRow = (String, String, String, f64, String, bool);
 
 enum Screen {
     Menu {
@@ -113,6 +113,11 @@ struct NowPlaying {
     queue_index: u32,
     queue_len: u32,
     volume: f64,
+    format_label: String,
+    lossless: bool,
+    /// Current spectrum bar levels (0..=7 each), polled alongside status.
+    /// Empty (not all-zero — genuinely empty) while disconnected.
+    spectrum: Vec<u8>,
 }
 
 struct App<'a> {
@@ -232,8 +237,25 @@ impl App<'_> {
     }
 
     async fn fetch_status(&self) -> NowPlaying {
+        // Two independent calls rather than folding spectrum into Status()
+        // — spectrum is optional/best-effort visual flair, so a failure
+        // there (or an older daemon without it) shouldn't blank the rest of
+        // the now-playing info.
+        let spectrum = self.proxy.spectrum().await.unwrap_or_default();
         match self.proxy.status().await {
-            Ok((status, title, artist, _album, position, duration, queue_index, queue_len, volume)) => NowPlaying {
+            Ok((
+                status,
+                title,
+                artist,
+                _album,
+                position,
+                duration,
+                queue_index,
+                queue_len,
+                volume,
+                format_label,
+                lossless,
+            )) => NowPlaying {
                 status,
                 title,
                 artist,
@@ -242,6 +264,9 @@ impl App<'_> {
                 queue_index,
                 queue_len,
                 volume,
+                format_label,
+                lossless,
+                spectrum,
             },
             Err(_) => NowPlaying {
                 status: "disconnected".to_string(),
@@ -252,6 +277,9 @@ impl App<'_> {
                 queue_index: 0,
                 queue_len: 0,
                 volume: 1.0,
+                format_label: String::new(),
+                lossless: false,
+                spectrum: Vec::new(),
             },
         }
     }
@@ -498,7 +526,17 @@ impl App<'_> {
             .map(|s| {
                 let stream_url = self.library.stream_url(&s.id);
                 let art_url = self.library.cover_art_url(&s.cover_art);
-                (stream_url, s.title.clone(), s.artist.clone(), s.album.clone(), art_url, s.duration)
+                let (format_label, lossless) = library::format_label(&s.suffix, s.bit_rate);
+                (
+                    stream_url,
+                    s.title.clone(),
+                    s.artist.clone(),
+                    s.album.clone(),
+                    art_url,
+                    s.duration,
+                    format_label,
+                    lossless,
+                )
             })
             .collect();
         match self.proxy.play_queue(tracks, 0).await {
@@ -594,11 +632,9 @@ impl App<'_> {
                 self.draw_song_table(frame, chunks[0], &title, rows, *selected, &now_playing.title);
             }
             Screen::Queue { tracks, selected } => {
-                // The daemon's queue doesn't carry format/bitrate yet (see
-                // the plan doc) — shown blank here rather than guessed.
                 let rows = tracks
                     .iter()
-                    .map(|(t, a, al, d)| (t.as_str(), a.as_str(), al.as_str(), *d, String::new(), false));
+                    .map(|(t, a, al, d, fmt, lossless)| (t.as_str(), a.as_str(), al.as_str(), *d, fmt.clone(), *lossless));
                 self.draw_song_table(
                     frame,
                     chunks[0],
@@ -689,7 +725,7 @@ impl App<'_> {
         // clipping the gauge/status line. No extra margin needed here.
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)])
+            .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)])
             .split(
                 Block::default()
                     .borders(Borders::ALL)
@@ -702,12 +738,21 @@ impl App<'_> {
             area,
         );
 
-        // Line 1: track — artist, styled like cmus's colored track line.
+        // Line 1: track — artist [format], styled like cmus's colored track line.
         let track = if now_playing.title.is_empty() { "(nothing loaded)" } else { &now_playing.title };
         let mut spans = vec![Span::styled(track, theme::accent())];
         if !now_playing.artist.is_empty() {
             spans.push(Span::raw("  —  "));
             spans.push(Span::styled(&now_playing.artist, Style::default().fg(Color::White)));
+        }
+        if !now_playing.format_label.is_empty() {
+            let format_style = if now_playing.lossless {
+                Style::default().fg(Color::Green).add_modifier(ratatui::style::Modifier::BOLD)
+            } else {
+                theme::muted()
+            };
+            spans.push(Span::raw("   "));
+            spans.push(Span::styled(format!("[{}]", now_playing.format_label), format_style));
         }
         if now_playing.queue_len > 0 {
             spans.push(Span::styled(
@@ -737,12 +782,47 @@ impl App<'_> {
             .label(label);
         frame.render_widget(gauge, rows[1]);
 
-        // Line 3: transport state + volume + keybinding hints.
+        // Line 3: a real spectrum visualizer — bar heights come from an
+        // actual FFT of the currently decoding audio (see
+        // daemon/src/visualizer.rs), not a simulated animation.
+        frame.render_widget(Paragraph::new(spectrum_line(&now_playing.spectrum)), rows[2]);
+
+        // Line 4: transport state + volume + keybinding hints.
         let vol_pct = (now_playing.volume * 100.0).round() as i32;
         let state_line = format!(
             "{}   vol {vol_pct}%   [space] play/pause  [\u{2190}/\u{2192}] seek  [+/-] volume  [n]ext [p]rev  [s]top  [Q] quit+stop",
             now_playing.status
         );
-        frame.render_widget(Paragraph::new(state_line).style(theme::muted()), rows[2]);
+        frame.render_widget(Paragraph::new(state_line).style(theme::muted()), rows[3]);
     }
+}
+
+/// Renders spectrum bar levels as a single line of block characters (one per
+/// bar, so an N-bar spectrum fits in exactly one terminal row regardless of
+/// N) — `▁` for silence up through `█` for the loudest level, cyan and
+/// brighter for taller bars so the line has some visual "pop" even in a
+/// screenshot, not just a flat color block.
+fn spectrum_line(levels: &[u8]) -> Line<'static> {
+    const CHARS: [char; 8] = ['\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
+    if levels.is_empty() {
+        return Line::from(Span::styled("(no signal)", theme::muted()));
+    }
+    let spans: Vec<Span<'static>> = levels
+        .iter()
+        .flat_map(|&level| {
+            let idx = (level as usize).min(CHARS.len() - 1);
+            let color = if idx >= 6 {
+                Color::LightCyan
+            } else if idx >= 3 {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            };
+            [
+                Span::styled(CHARS[idx].to_string(), Style::default().fg(color)),
+                Span::raw(" "),
+            ]
+        })
+        .collect();
+    Line::from(spans)
 }
