@@ -69,6 +69,17 @@ pub struct Song {
     pub suffix: String,
     #[serde(default, rename = "bitRate")]
     pub bit_rate: Option<u32>,
+    /// An ISO-8601 timestamp if this song is starred/favorited, per the
+    /// Subsonic API convention — absent (not a bool) otherwise. Only the
+    /// presence matters here; the actual timestamp value is never shown.
+    #[serde(default)]
+    pub starred: Option<String>,
+}
+
+impl Song {
+    pub fn is_starred(&self) -> bool {
+        self.starred.is_some()
+    }
 }
 
 /// Suffixes for formats that are lossless *as a container* — `m4a`/`mp4`
@@ -287,6 +298,49 @@ impl Client {
         parse(root["albumList2"]["album"].take())
     }
 
+    /// `maraetai-service`'s native `getRecentlyPlayed` — per-song
+    /// de-duplicated, most-recent-first listen history, built from the
+    /// server's own play store (which the daemon now actually feeds via
+    /// scrobbling). Not part of the Subsonic spec; a plain Navidrome/
+    /// Subsonic server without this proxy in front of it would 404, which
+    /// just surfaces as an error like any other failed fetch.
+    pub async fn recently_played(&self) -> Result<Vec<Song>> {
+        let mut root = self.get_json("rest/getRecentlyPlayed.view", &[]).await?;
+        parse(root["recentlyPlayed"]["song"].take())
+    }
+
+    /// `maraetai-service`'s native `getOnRepeat` — the most-replayed songs,
+    /// from the same play store.
+    pub async fn on_repeat(&self) -> Result<Vec<Song>> {
+        let mut root = self.get_json("rest/getOnRepeat.view", &[]).await?;
+        parse(root["onRepeat"]["song"].take())
+    }
+
+    /// `maraetai-service`'s native `getSongsForYou` — a personalized mix
+    /// built from play history.
+    pub async fn songs_for_you(&self) -> Result<Vec<Song>> {
+        let mut root = self.get_json("rest/getSongsForYou.view", &[]).await?;
+        parse(root["songsForYou"]["song"].take())
+    }
+
+    /// `maraetai-service`'s native `getFavourites` — a paged view of the
+    /// user's starred songs (the proxy pages the non-pageable `getStarred2`
+    /// on the fast side).
+    pub async fn favourites(&self) -> Result<Vec<Song>> {
+        let mut root = self.get_json("rest/getFavourites.view", &[]).await?;
+        parse(root["favourites"]["song"].take())
+    }
+
+    /// Stars/unstars a song — the standard Subsonic `star`/`unstar`
+    /// endpoints, passed straight through `maraetai-service`'s proxy to the
+    /// real Navidrome underneath (no native endpoint needed for this half —
+    /// only *reading back* the starred list is a maraetai-service addition).
+    pub async fn set_starred(&self, song_id: &str, starred: bool) -> Result<()> {
+        let path = if starred { "rest/star.view" } else { "rest/unstar.view" };
+        self.get_json(path, &[("id", song_id)]).await?;
+        Ok(())
+    }
+
     /// Fetches lyrics for a track: OpenSubsonic's id-based, potentially
     /// time-synced `getLyricsBySongId` first, falling back to the legacy
     /// artist+title `getLyrics` (parsed as LRC if it looks synced, else
@@ -430,12 +484,124 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// Like `respond_once`, but also hands back the captured request line +
+    /// headers so a test can assert on the exact path/query the client sent
+    /// — for endpoints where *which* URL was requested is the thing under
+    /// test, not just how the response gets parsed.
+    async fn respond_once_capturing(body: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            request
+        });
+        (format!("http://{addr}"), handle)
+    }
+
     fn test_creds(server_url: String) -> Credentials {
         Credentials {
             server_url,
             username: "alice".into(),
             password: "hunter2".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn parses_real_shaped_recently_played() {
+        // Shape matches maraetai-service's actual subsonic.RecentlyPlayed
+        // container (internal/subsonic/response.go): a plain song list
+        // under "recentlyPlayed", each with the non-standard playedAt
+        // extension.
+        let url = respond_once(
+            r#"{"subsonic-response":{"status":"ok","recentlyPlayed":{"song":[
+                {"id":"s1","title":"Angel","artist":"Massive Attack","album":"Mezzanine","duration":379,"playedAt":1700000000}
+            ]}}}"#,
+        )
+        .await;
+        let client = Client::new(test_creds(url));
+        let songs = client.recently_played().await.unwrap();
+        assert_eq!(songs.len(), 1);
+        assert_eq!(songs[0].title, "Angel");
+    }
+
+    #[tokio::test]
+    async fn parses_real_shaped_on_repeat() {
+        let url = respond_once(
+            r#"{"subsonic-response":{"status":"ok","onRepeat":{"song":[
+                {"id":"s1","title":"Teardrop","artist":"Massive Attack","playCount":12}
+            ]}}}"#,
+        )
+        .await;
+        let client = Client::new(test_creds(url));
+        let songs = client.on_repeat().await.unwrap();
+        assert_eq!(songs.len(), 1);
+        assert_eq!(songs[0].title, "Teardrop");
+    }
+
+    #[tokio::test]
+    async fn parses_real_shaped_songs_for_you() {
+        let url = respond_once(
+            r#"{"subsonic-response":{"status":"ok","songsForYou":{"song":[
+                {"id":"s1","title":"Glory Box","artist":"Portishead","reason":"Because you play Massive Attack"}
+            ]}}}"#,
+        )
+        .await;
+        let client = Client::new(test_creds(url));
+        let songs = client.songs_for_you().await.unwrap();
+        assert_eq!(songs.len(), 1);
+        assert_eq!(songs[0].title, "Glory Box");
+    }
+
+    #[tokio::test]
+    async fn parses_real_shaped_favourites_including_starred_flag() {
+        let url = respond_once(
+            r#"{"subsonic-response":{"status":"ok","favourites":{"song":[
+                {"id":"s1","title":"Angel","starred":"2024-01-01T00:00:00.000Z"}
+            ]}}}"#,
+        )
+        .await;
+        let client = Client::new(test_creds(url));
+        let songs = client.favourites().await.unwrap();
+        assert_eq!(songs.len(), 1);
+        assert!(songs[0].is_starred());
+    }
+
+    #[test]
+    fn song_without_a_starred_field_is_not_starred() {
+        let song: Song = serde_json::from_str(r#"{"id":"s1","title":"Angel"}"#).unwrap();
+        assert!(!song.is_starred());
+    }
+
+    /// Confirms `set_starred` hits the exact endpoints/params the Subsonic
+    /// spec (and every other maraetai client) uses — `star`/`unstar` with an
+    /// `id` query param — by capturing the real outgoing request rather than
+    /// just trusting the URL-building code reads correctly.
+    #[tokio::test]
+    async fn set_starred_true_requests_star_view_with_the_song_id() {
+        let (url, request) = respond_once_capturing(r#"{"subsonic-response":{"status":"ok"}}"#).await;
+        let client = Client::new(test_creds(url));
+        client.set_starred("song123", true).await.unwrap();
+        let request_line = request.await.unwrap();
+        assert!(request_line.starts_with("GET /rest/star.view?"), "got: {request_line}");
+        assert!(request_line.contains("id=song123"), "got: {request_line}");
+    }
+
+    #[tokio::test]
+    async fn set_starred_false_requests_unstar_view() {
+        let (url, request) = respond_once_capturing(r#"{"subsonic-response":{"status":"ok"}}"#).await;
+        let client = Client::new(test_creds(url));
+        client.set_starred("song123", false).await.unwrap();
+        let request_line = request.await.unwrap();
+        assert!(request_line.starts_with("GET /rest/unstar.view?"), "got: {request_line}");
     }
 
     #[tokio::test]

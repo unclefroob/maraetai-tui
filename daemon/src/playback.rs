@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use maraetai_common::Credentials;
 use maraetai_common::auth::AuthParams;
+use rand::seq::SliceRandom;
 use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink, Source};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -52,6 +53,36 @@ pub enum Status {
     Stopped,
     Playing,
     Paused,
+}
+
+/// `Track` loops the current track on natural end (not on a manual `Next` —
+/// that still advances normally); `Queue` loops back to the start of the
+/// queue (or a fresh shuffle of it, if shuffle is also on) once the last
+/// track finishes, instead of stopping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RepeatMode {
+    #[default]
+    Off,
+    Track,
+    Queue,
+}
+
+impl RepeatMode {
+    fn cycle(self) -> Self {
+        match self {
+            RepeatMode::Off => RepeatMode::Track,
+            RepeatMode::Track => RepeatMode::Queue,
+            RepeatMode::Queue => RepeatMode::Off,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RepeatMode::Off => "off",
+            RepeatMode::Track => "track",
+            RepeatMode::Queue => "queue",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -101,11 +132,13 @@ pub struct Snapshot {
     /// `visualizer.rs`. All-zero while stopped/paused or right after a
     /// track/seek change (not yet enough buffered samples).
     pub spectrum: [u8; visualizer::BARS],
+    pub repeat: RepeatMode,
+    pub shuffle: bool,
 }
 
 impl Snapshot {
     pub fn has_next(&self) -> bool {
-        self.queue_index + 1 < self.queue_len
+        self.queue_index + 1 < self.queue_len || self.repeat == RepeatMode::Queue
     }
 }
 
@@ -120,6 +153,8 @@ impl Default for Snapshot {
             queue_len: 0,
             queue: Vec::new(),
             spectrum: [0; visualizer::BARS],
+            repeat: RepeatMode::Off,
+            shuffle: false,
         }
     }
 }
@@ -134,6 +169,12 @@ pub enum Command {
     /// view picking an arbitrary upcoming track) — distinct from `PlayQueue`,
     /// which replaces the queue itself.
     PlayAt(usize),
+    /// Adds tracks to the end of the current queue without interrupting
+    /// whatever's already playing — distinct from `PlayQueue`, which always
+    /// replaces the queue and starts over. If nothing is currently playing,
+    /// playback starts at the first appended track instead (otherwise
+    /// "append" would silently do nothing audible).
+    AppendQueue(Vec<TrackMeta>),
     Next,
     Previous,
     Pause,
@@ -141,6 +182,8 @@ pub enum Command {
     Stop,
     Seek(Duration),
     SetVolume(f32),
+    CycleRepeat,
+    ToggleShuffle,
     Shutdown,
 }
 
@@ -208,6 +251,9 @@ impl PlaybackHandle {
     pub fn play_at(&self, index: usize) {
         self.send(Command::PlayAt(index));
     }
+    pub fn append_queue(&self, tracks: Vec<TrackMeta>) {
+        self.send(Command::AppendQueue(tracks));
+    }
     pub fn next(&self) {
         self.send(Command::Next);
     }
@@ -228,6 +274,12 @@ impl PlaybackHandle {
     }
     pub fn set_volume(&self, volume: f32) {
         self.send(Command::SetVolume(volume));
+    }
+    pub fn cycle_repeat(&self) {
+        self.send(Command::CycleRepeat);
+    }
+    pub fn toggle_shuffle(&self) {
+        self.send(Command::ToggleShuffle);
     }
     pub fn shutdown(&self) {
         self.send(Command::Shutdown);
@@ -268,6 +320,15 @@ struct EngineState {
     http: reqwest::blocking::Client,
     queue: Vec<TrackMeta>,
     index: usize,
+    /// A permutation of `0..queue.len()` that `Next`/`Previous` actually
+    /// step through — the identity order when `shuffle` is off. Invariant
+    /// maintained by `start_playback_at`: `play_order[order_pos] ==
+    /// index` always holds after it returns, regardless of *how* playback
+    /// got there (a shuffled `Next`, or a manual `PlayAt` jump).
+    play_order: Vec<usize>,
+    order_pos: usize,
+    repeat: RepeatMode,
+    shuffle: bool,
     analyzer: SpectrumAnalyzer,
     sample_ring: Arc<visualizer::SampleRing>,
     /// Channels/sample-rate of whatever's currently loaded — captured from
@@ -306,6 +367,10 @@ fn run_engine(
         http: reqwest::blocking::Client::new(),
         queue: Vec::new(),
         index: 0,
+        play_order: Vec::new(),
+        order_pos: 0,
+        repeat: RepeatMode::Off,
+        shuffle: false,
         analyzer,
         sample_ring,
         current_format: None,
@@ -318,8 +383,28 @@ fn run_engine(
             Ok(Command::PlayQueue { tracks, start_index }) => {
                 state.queue = tracks;
                 snapshot.lock().expect("poisoned").queue = state.queue.clone();
+                regenerate_play_order(&mut state, None);
                 let start_index = start_index.min(state.queue.len().saturating_sub(1));
                 start_playback_at(&mut state, &snapshot, &events, start_index);
+            }
+            Ok(Command::AppendQueue(tracks)) => {
+                if !tracks.is_empty() {
+                    let start_of_new = state.queue.len();
+                    state.queue.extend(tracks);
+                    // New tracks join the end of the play order regardless
+                    // of shuffle — "append" means "play later", not
+                    // "shuffle in somewhere unpredictable".
+                    state.play_order.extend(start_of_new..state.queue.len());
+                    snapshot.lock().expect("poisoned").queue = state.queue.clone();
+                    if state.sink.is_none() {
+                        // Nothing was playing — appending to an empty/
+                        // stopped queue must still be audible, so start at
+                        // what was just added.
+                        start_playback_at(&mut state, &snapshot, &events, start_of_new);
+                    } else {
+                        snapshot.lock().expect("poisoned").queue_len = state.queue.len();
+                    }
+                }
             }
             Ok(Command::PlayAt(index)) => {
                 if index < state.queue.len() {
@@ -327,17 +412,26 @@ fn run_engine(
                 }
             }
             Ok(Command::Next) => {
-                if state.index + 1 < state.queue.len() {
-                    let next = state.index + 1;
+                if state.order_pos + 1 < state.play_order.len() {
+                    let next = state.play_order[state.order_pos + 1];
+                    start_playback_at(&mut state, &snapshot, &events, next);
+                } else if state.repeat == RepeatMode::Queue && !state.play_order.is_empty() {
+                    // Wrapping the queue is a natural point to reshuffle, so
+                    // a shuffled repeat doesn't replay the exact same order
+                    // every lap.
+                    if state.shuffle {
+                        regenerate_play_order(&mut state, None);
+                    }
+                    let next = state.play_order[0];
                     start_playback_at(&mut state, &snapshot, &events, next);
                 }
-                // No next track: matches the common player convention of
-                // doing nothing on "next" at the end of the queue, rather
-                // than stopping.
+                // Otherwise: at the end of the queue with repeat off —
+                // matches the common player convention of doing nothing on
+                // "next" rather than stopping.
             }
             Ok(Command::Previous) => {
                 let position = current_position(&state);
-                let restart_current = position > RESTART_THRESHOLD || state.index == 0;
+                let restart_current = position > RESTART_THRESHOLD || state.order_pos == 0;
                 if restart_current {
                     // Restarting counts as finishing this listen of the
                     // track (a later restart-and-relisten is a separate,
@@ -349,7 +443,7 @@ fn run_engine(
                         snapshot.lock().expect("poisoned").position = Duration::ZERO;
                     }
                 } else {
-                    let prev = state.index - 1;
+                    let prev = state.play_order[state.order_pos - 1];
                     start_playback_at(&mut state, &snapshot, &events, prev);
                 }
             }
@@ -393,6 +487,19 @@ fn run_engine(
                 }
                 snapshot.lock().expect("poisoned").volume = v;
             }
+            Ok(Command::CycleRepeat) => {
+                state.repeat = state.repeat.cycle();
+                snapshot.lock().expect("poisoned").repeat = state.repeat;
+            }
+            Ok(Command::ToggleShuffle) => {
+                state.shuffle = !state.shuffle;
+                // Anchoring to the current track means turning shuffle on
+                // mid-play doesn't jump away from what's playing — only
+                // what's queued *after* it gets randomized.
+                let current = state.index;
+                regenerate_play_order(&mut state, Some(current));
+                snapshot.lock().expect("poisoned").shuffle = state.shuffle;
+            }
             Ok(Command::Shutdown) => {
                 if let Some(sink) = state.sink.take() {
                     sink.stop();
@@ -409,6 +516,38 @@ fn run_engine(
 
 fn current_position(state: &EngineState) -> Duration {
     state.sink.as_ref().map(Sink::get_pos).unwrap_or_default()
+}
+
+/// Rebuilds `play_order` for the current `queue` and resyncs `order_pos` to
+/// wherever `state.index` ends up in it — the invariant `Next`/`Previous`
+/// (and `start_playback_at`, after any jump) rely on. With shuffle off,
+/// it's just the identity order `0..len`. With shuffle on, `anchor` (when
+/// it's a valid index) is kept at the front of the new order — so toggling
+/// shuffle on mid-track doesn't jump away from what's currently playing,
+/// only what's queued *after* it gets randomized; `None` (a freshly
+/// replaced queue, or reshuffling on a repeat-queue wrap) shuffles
+/// everything with nothing pinned.
+fn regenerate_play_order(state: &mut EngineState, anchor: Option<usize>) {
+    state.play_order = shuffled_play_order(state.queue.len(), state.shuffle, anchor);
+    state.order_pos = state.play_order.iter().position(|&i| i == state.index).unwrap_or(0);
+}
+
+/// The pure permutation logic behind [`regenerate_play_order`] — factored
+/// out so it's unit-testable without needing a real `EngineState` (which
+/// owns a live audio output stream, not something to open in a test).
+fn shuffled_play_order(len: usize, shuffle: bool, anchor: Option<usize>) -> Vec<usize> {
+    if !shuffle || len == 0 {
+        return (0..len).collect();
+    }
+    if let Some(anchor) = anchor.filter(|&a| a < len) {
+        let mut rest: Vec<usize> = (0..len).filter(|&i| i != anchor).collect();
+        rest.shuffle(&mut rand::thread_rng());
+        std::iter::once(anchor).chain(rest).collect()
+    } else {
+        let mut order: Vec<usize> = (0..len).collect();
+        order.shuffle(&mut rand::thread_rng());
+        order
+    }
 }
 
 /// Starts playing `state.queue[index]`, replacing whatever was playing.
@@ -432,6 +571,11 @@ fn start_playback_at(
         return;
     };
     state.index = index;
+    // Keeps `play_order[order_pos] == index` true regardless of *how* we
+    // got here — a shuffled `Next`/`Previous` step, or a manual `PlayAt`
+    // jump from the Queue view that lands somewhere play_order wasn't
+    // already pointing at.
+    state.order_pos = state.play_order.iter().position(|&i| i == index).unwrap_or(index);
 
     let mut reader = RangeReader::new(state.http.clone(), meta.stream_url.clone());
     // `RangeReader` only learns the resource's total length lazily, from the
@@ -491,8 +635,23 @@ fn poll_progress(state: &mut EngineState, snapshot: &Arc<Mutex<Snapshot>>, event
     let currently_playing = snapshot.lock().expect("poisoned").status == Status::Playing;
 
     if ended && currently_playing {
-        if state.index + 1 < state.queue.len() {
-            let next = state.index + 1;
+        if state.repeat == RepeatMode::Track {
+            // Reaching the natural end (not a manual `Next`) loops the same
+            // track — reloading fresh rather than seeking the now-exhausted
+            // sink back to zero, which isn't reliably possible once a
+            // source has already reported end-of-stream. `start_playback_at`
+            // scrobbles the just-finished play (if eligible) at its top
+            // before reloading, exactly like any other track transition.
+            let current = state.index;
+            start_playback_at(state, snapshot, events, current);
+        } else if state.order_pos + 1 < state.play_order.len() {
+            let next = state.play_order[state.order_pos + 1];
+            start_playback_at(state, snapshot, events, next);
+        } else if state.repeat == RepeatMode::Queue && !state.play_order.is_empty() {
+            if state.shuffle {
+                regenerate_play_order(state, None);
+            }
+            let next = state.play_order[0];
             start_playback_at(state, snapshot, events, next);
         } else {
             // The queue is truly exhausted — `start_playback_at` won't run
@@ -596,6 +755,59 @@ mod tests {
     #[test]
     fn scrobble_threshold_caps_at_four_minutes_for_long_songs() {
         assert_eq!(scrobble_threshold(Duration::from_secs(60 * 20)), Duration::from_secs(4 * 60));
+    }
+
+    #[test]
+    fn repeat_mode_cycles_off_track_queue_and_back_to_off() {
+        assert_eq!(RepeatMode::Off.cycle(), RepeatMode::Track);
+        assert_eq!(RepeatMode::Track.cycle(), RepeatMode::Queue);
+        assert_eq!(RepeatMode::Queue.cycle(), RepeatMode::Off);
+    }
+
+    #[test]
+    fn play_order_is_identity_when_shuffle_is_off_regardless_of_anchor() {
+        assert_eq!(shuffled_play_order(5, false, Some(3)), vec![0, 1, 2, 3, 4]);
+        assert_eq!(shuffled_play_order(5, false, None), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn play_order_pins_the_anchor_at_the_front_when_shuffled() {
+        // Run several times since shuffling is random — the anchor's
+        // position is the one thing that must never vary.
+        for _ in 0..20 {
+            let order = shuffled_play_order(6, true, Some(4));
+            assert_eq!(order[0], 4, "anchor must stay pinned at the front: {order:?}");
+            let mut sorted = order.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, vec![0, 1, 2, 3, 4, 5], "must still be a full permutation: {order:?}");
+        }
+    }
+
+    #[test]
+    fn play_order_is_a_full_permutation_with_no_anchor() {
+        for _ in 0..20 {
+            let order = shuffled_play_order(6, true, None);
+            let mut sorted = order.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, vec![0, 1, 2, 3, 4, 5]);
+        }
+    }
+
+    #[test]
+    fn play_order_of_an_empty_queue_is_empty() {
+        assert!(shuffled_play_order(0, true, None).is_empty());
+        assert!(shuffled_play_order(0, false, None).is_empty());
+    }
+
+    #[test]
+    fn play_order_ignores_an_out_of_range_anchor() {
+        // Defensive: an anchor that's somehow no longer a valid index (e.g.
+        // stale after the queue shrank) must not panic or produce a short
+        // permutation — it's simply treated as "no anchor".
+        let order = shuffled_play_order(4, true, Some(99));
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 1, 2, 3]);
     }
 
     /// Verifies `spawn_scrobble` against `maraetai-service`'s actual

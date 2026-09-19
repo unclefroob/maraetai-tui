@@ -31,3 +31,4 @@ rodio = { version = "=0.21.1", default-features = false, features = ["symphonia-
 mpris-server = { version = "0.10", features = ["tokio"] }
 nix = { version = "0.29", features = ["process", "signal", "fs"] }
 rustfft = "6"
+rand.workspace = true

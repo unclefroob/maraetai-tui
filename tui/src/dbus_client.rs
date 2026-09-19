@@ -21,6 +21,9 @@ pub type QueueEntry = (String, String, String, String, String, f64, String, bool
 pub trait Control {
     async fn play_queue(&self, tracks: Vec<QueueEntry>, start_index: u32) -> zbus::Result<()>;
     async fn play_at(&self, index: u32) -> zbus::Result<()>;
+    /// Adds tracks to the end of the queue without interrupting playback —
+    /// distinct from `play_queue`, which always replaces the queue.
+    async fn append_queue(&self, tracks: Vec<QueueEntry>) -> zbus::Result<()>;
     #[allow(clippy::type_complexity)]
     async fn queue(&self) -> zbus::Result<Vec<(String, String, String, f64, String, bool)>>;
     async fn spectrum(&self) -> zbus::Result<Vec<u8>>;
@@ -31,10 +34,13 @@ pub trait Control {
     async fn stop(&self) -> zbus::Result<()>;
     async fn seek_to(&self, position_secs: f64) -> zbus::Result<()>;
     async fn set_volume(&self, volume: f64) -> zbus::Result<()>;
+    /// Cycles Off -> Track -> Queue -> Off.
+    async fn cycle_repeat(&self) -> zbus::Result<()>;
+    async fn toggle_shuffle(&self) -> zbus::Result<()>;
     #[allow(clippy::type_complexity)]
     async fn status(
         &self,
-    ) -> zbus::Result<(String, String, String, String, f64, f64, u32, u32, f64, String, bool, String, String)>;
+    ) -> zbus::Result<(String, String, String, String, f64, f64, u32, u32, f64, String, bool, String, String, String, bool)>;
     async fn quit(&self) -> zbus::Result<()>;
 }
 

@@ -70,6 +70,14 @@ impl ControlInterface {
         self.playback.play_at(index as usize);
     }
 
+    /// Adds tracks to the end of the queue without interrupting whatever's
+    /// already playing — distinct from `PlayQueue`, which always replaces
+    /// the queue and starts over.
+    async fn append_queue(&self, tracks: Vec<QueueEntry>) {
+        let tracks = tracks.into_iter().map(to_track_meta).collect();
+        self.playback.append_queue(tracks);
+    }
+
     /// The full current queue: (title, artist, album, duration_secs,
     /// format_label, lossless) per track, in order — for a TUI "Queue"
     /// view. Not a property (like MPRIS's `Metadata`) since it's a list,
@@ -135,18 +143,32 @@ impl ControlInterface {
         self.playback.set_volume(volume.clamp(0.0, 1.0) as f32);
     }
 
+    /// Cycles Off -> Track -> Queue -> Off. The new mode is picked up on the
+    /// next `status()` poll rather than returned here, matching every other
+    /// mutating method on this interface.
+    async fn cycle_repeat(&self) {
+        self.playback.cycle_repeat();
+    }
+
+    async fn toggle_shuffle(&self) {
+        self.playback.toggle_shuffle();
+    }
+
     /// A compact status summary for `maraetai daemon status` and the TUI's
     /// now-playing bar: playback status, current track (title, artist,
     /// album), position/duration in seconds (duration 0 if unknown),
     /// (queue index, queue length), volume (0.0-1.0), format (format_label,
-    /// lossless), cover art URL (empty if none), and the Subsonic song id
+    /// lossless), cover art URL (empty if none), the Subsonic song id
     /// (empty if none — used by the TUI to fetch lyrics for the current
-    /// track). Kept as a plain method (not properties) since it's a
+    /// track), repeat mode ("off"/"track"/"queue"), and whether shuffle is
+    /// on. Kept as a plain method (not properties) since it's a
     /// point-in-time snapshot read by a one-shot CLI command or a polling
     /// loop, not something a D-Bus client watches for changes — that's what
     /// MPRIS's properties (which do emit `PropertiesChanged`) are for.
     #[allow(clippy::type_complexity)]
-    async fn status(&self) -> (String, String, String, String, f64, f64, u32, u32, f64, String, bool, String, String) {
+    async fn status(
+        &self,
+    ) -> (String, String, String, String, f64, f64, u32, u32, f64, String, bool, String, String, String, bool) {
         let snap = self.playback.snapshot();
         let status = match snap.status {
             Status::Playing => "playing",
@@ -180,6 +202,8 @@ impl ControlInterface {
             lossless,
             art_url,
             song_id,
+            snap.repeat.as_str().to_string(),
+            snap.shuffle,
         )
     }
 

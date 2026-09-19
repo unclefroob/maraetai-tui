@@ -90,6 +90,8 @@ async fn run_daemon_action(action: DaemonAction) -> Result<()> {
                     _lossless,
                     _art_url,
                     _song_id,
+                    _repeat,
+                    _shuffle,
                 )) => {
                     if title.is_empty() {
                         println!("daemon running — {status}");
