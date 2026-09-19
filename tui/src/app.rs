@@ -3,60 +3,117 @@
 //! way every other maraetai client does) and to the daemon over D-Bus for
 //! playback/queue control.
 //!
-//! Visually modeled on `cmus`: a colored, always-visible now-playing bar
-//! with a real progress gauge, column-aligned track tables instead of
-//! plain text lists, the currently-playing row highlighted wherever it
-//! appears, and `1`/`2` as quick view switches (Library / Queue) alongside
-//! the drill-down navigation stack.
+//! Styled after [rmpc](https://github.com/mierak/rmpc) (itself inspired by
+//! ncmpcpp): rounded borders, a blue-centric palette (black-on-blue
+//! selection, not white-on-blue), a persistent top tab bar instead of a
+//! "menu screen" you enter, scrollbars on lists, artist-first columns with
+//! right-aligned duration, and playback state shown as a bracketed
+//! `[State]` tag. Not a port of rmpc's full (very elaborate, RON-based)
+//! theming DSL — just its visual vocabulary, applied directly.
 //!
-//! Navigation is a plain stack (`Vec<Screen>`) — drilling in pushes, `Esc`/
-//! `Backspace` pops. Playing a song from a list queues the *rest* of that
-//! list from the selected point onward (so picking track 3 of an album
-//! naturally plays 3, 4, 5, ...); the daemon owns queue advancement, so
-//! `Next`/`Previous` (here or from a hardware media key) work the same way
-//! regardless of which screen started the queue.
+//! Each tab has its own drill-down stack (`Vec<Screen>`) — picking a tab
+//! resets to that tab's root list; `Esc`/`Backspace` pops back up within it.
+//! Playing a song from a list queues the *rest* of that list from the
+//! selected point onward (so picking track 3 of an album naturally plays
+//! 3, 4, 5, ...); the daemon owns queue advancement, so `Next`/`Previous`
+//! (here or from a hardware media key) work the same way regardless of
+//! which screen started the queue.
 
 use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Gauge, List, ListItem, ListState, Paragraph, Row, Table, TableState};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Cell, Gauge, List, ListItem, ListState, Paragraph, Row, Scrollbar,
+    ScrollbarOrientation, ScrollbarState, Table, TableState,
+};
 
 use crate::dbus_client::{ControlProxy, QueueEntry};
 use crate::library::{self, Album, Artist, Genre, Playlist, Song};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
-const MENU_ITEMS: [&str; 4] = ["Albums", "Artists", "Playlists", "Genres"];
 const SEEK_STEP: f64 = 5.0;
 const VOLUME_STEP: f64 = 0.05;
 
-/// A cmus-inspired palette — cyan accents on the default terminal
-/// background, a blue selection bar, yellow column headers.
+/// The persistent top-level tabs — always visible, switched with `1`-`6`
+/// (rmpc itself uses configurable keys per tab; fixed number keys are a
+/// reasonable single-user default here). `Search` and `Queue` are tabs like
+/// any other, not special-cased screens.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Albums,
+    Artists,
+    Playlists,
+    Genres,
+    Search,
+    Queue,
+}
+
+const TABS: [Tab; 6] = [Tab::Albums, Tab::Artists, Tab::Playlists, Tab::Genres, Tab::Search, Tab::Queue];
+
+impl Tab {
+    fn label(self) -> &'static str {
+        match self {
+            Tab::Albums => "Albums",
+            Tab::Artists => "Artists",
+            Tab::Playlists => "Playlists",
+            Tab::Genres => "Genres",
+            Tab::Search => "Search",
+            Tab::Queue => "Queue",
+        }
+    }
+}
+
+/// An rmpc-inspired palette: blue borders/accents, black-on-blue selection
+/// (not white-on-blue), rounded corners everywhere. Yellow is reserved
+/// specifically for the bracketed playback-state tag (matching rmpc's own
+/// scoping of that color to just that one element) and green specifically
+/// for "this is lossless" — neither is used as a general accent.
 mod theme {
     use ratatui::style::{Color, Modifier, Style};
 
     pub fn accent() -> Style {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)
     }
     pub fn header() -> Style {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
     }
     pub fn selected() -> Style {
-        Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)
+        Style::default().bg(Color::Blue).fg(Color::Black).add_modifier(Modifier::BOLD)
     }
     pub fn now_playing_row() -> Style {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)
     }
     pub fn muted() -> Style {
         Style::default().fg(Color::DarkGray)
     }
     pub fn border() -> Style {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(Color::Blue)
     }
+    pub fn active_tab() -> Style {
+        selected()
+    }
+    pub fn inactive_tab() -> Style {
+        Style::default()
+    }
+    pub fn state_tag() -> Style {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    }
+    pub fn lossless() -> Style {
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+    }
+}
+
+fn rounded_block(title: impl Into<String>) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme::border())
+        .title(title.into())
 }
 
 /// One entry in the "Queue" view — title/artist/album/duration/format_label/
@@ -64,9 +121,6 @@ mod theme {
 type QueueRow = (String, String, String, f64, String, bool);
 
 enum Screen {
-    Menu {
-        selected: usize,
-    },
     AlbumList {
         title: String,
         albums: Vec<Album>,
@@ -123,6 +177,9 @@ struct NowPlaying {
 struct App<'a> {
     proxy: ControlProxy<'a>,
     library: library::Client,
+    active_tab: Tab,
+    /// The active tab's drill-down stack — switching tabs replaces this
+    /// wholesale with a single root screen; `Esc`/`Backspace` pops within it.
     stack: Vec<Screen>,
     /// A transient status/error line shown above the now-playing bar — e.g.
     /// "Loading…" during a fetch, or a fetch failure. Cleared on the next
@@ -134,11 +191,13 @@ pub async fn run(proxy: ControlProxy<'_>, creds: maraetai_common::Credentials) -
     let mut app = App {
         proxy,
         library: library::Client::new(creds),
-        stack: vec![Screen::Menu { selected: 0 }],
+        active_tab: Tab::Albums,
+        stack: Vec::new(),
         message: String::new(),
     };
 
     let mut terminal = ratatui::init();
+    app.switch_tab(Tab::Albums, &mut terminal).await;
     let result = app.event_loop(&mut terminal).await;
     ratatui::restore();
     result
@@ -151,7 +210,7 @@ fn fmt_time(secs: f64) -> String {
 
 impl App<'_> {
     fn top(&self) -> &Screen {
-        self.stack.last().expect("stack is never empty")
+        self.stack.last().expect("stack is never empty once a tab is active")
     }
 
     async fn event_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
@@ -211,19 +270,14 @@ impl App<'_> {
                 KeyCode::Char('+') | KeyCode::Char('=') => {
                     let _ = self.proxy.set_volume((now_playing.volume + VOLUME_STEP).min(1.0)).await;
                 }
-                KeyCode::Char('1') => {
-                    self.stack = vec![Screen::Menu { selected: 0 }];
-                }
-                KeyCode::Char('2') => {
-                    self.load_queue_view(terminal).await;
+                KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                    let idx = c.to_digit(10).expect("checked is_ascii_digit") as usize - 1;
+                    if let Some(&tab) = TABS.get(idx) {
+                        self.switch_tab(tab, terminal).await;
+                    }
                 }
                 KeyCode::Char('/') => {
-                    self.stack.push(Screen::Search {
-                        query: String::new(),
-                        editing: true,
-                        results: Vec::new(),
-                        selected: 0,
-                    });
+                    self.switch_tab(Tab::Search, terminal).await;
                 }
                 KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
                 KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
@@ -284,15 +338,64 @@ impl App<'_> {
         }
     }
 
-    async fn load_queue_view(&mut self, terminal: &mut ratatui::DefaultTerminal) {
-        self.message = "Loading queue…".to_string();
-        let _ = terminal.draw(|f| self.draw_message(f));
-        match self.proxy.queue().await {
-            Ok(tracks) => {
-                self.message.clear();
-                self.stack.push(Screen::Queue { tracks, selected: 0 });
+    /// Switches the active tab, replacing the drill-down stack with that
+    /// tab's freshly-fetched root screen. A fetch failure still leaves a
+    /// (empty) screen in place — `self.message` carries the error — rather
+    /// than an empty stack, which `top()` never tolerates.
+    async fn switch_tab(&mut self, tab: Tab, terminal: &mut ratatui::DefaultTerminal) {
+        self.active_tab = tab;
+        self.stack.clear();
+        match tab {
+            Tab::Albums => {
+                let albums = self
+                    .load(terminal, "Loading albums…", |c| Box::pin(async move { c.albums().await }))
+                    .await
+                    .unwrap_or_default();
+                self.stack.push(Screen::AlbumList { title: "Albums".into(), albums, selected: 0 });
             }
-            Err(e) => self.message = format!("error: {e}"),
+            Tab::Artists => {
+                let artists = self
+                    .load(terminal, "Loading artists…", |c| Box::pin(async move { c.artists().await }))
+                    .await
+                    .unwrap_or_default();
+                self.stack.push(Screen::ArtistList { artists, selected: 0 });
+            }
+            Tab::Playlists => {
+                let playlists = self
+                    .load(terminal, "Loading playlists…", |c| Box::pin(async move { c.playlists().await }))
+                    .await
+                    .unwrap_or_default();
+                self.stack.push(Screen::PlaylistList { playlists, selected: 0 });
+            }
+            Tab::Genres => {
+                let genres = self
+                    .load(terminal, "Loading genres…", |c| Box::pin(async move { c.genres().await }))
+                    .await
+                    .unwrap_or_default();
+                self.stack.push(Screen::GenreList { genres, selected: 0 });
+            }
+            Tab::Search => {
+                self.stack.push(Screen::Search {
+                    query: String::new(),
+                    editing: true,
+                    results: Vec::new(),
+                    selected: 0,
+                });
+            }
+            Tab::Queue => {
+                self.message = "Loading queue…".to_string();
+                let _ = terminal.draw(|f| self.draw_message(f));
+                match self.proxy.queue().await {
+                    Ok(tracks) => {
+                        self.message.clear();
+                        self.stack.push(Screen::Queue { tracks, selected: 0 });
+                    }
+                    Err(e) => {
+                        self.message = format!("error: {e}");
+                        self.stack.push(Screen::Queue { tracks: Vec::new(), selected: 0 });
+                    }
+                }
+            }
         }
     }
 
@@ -313,7 +416,7 @@ impl App<'_> {
                 true
             }
             KeyCode::Esc => {
-                self.stack.pop();
+                *editing = false;
                 true
             }
             KeyCode::Enter => {
@@ -328,7 +431,6 @@ impl App<'_> {
     fn move_selection(&mut self, delta: i32) {
         let Some(screen) = self.stack.last_mut() else { return };
         let (selected, len) = match screen {
-            Screen::Menu { selected } => (selected, MENU_ITEMS.len()),
             Screen::AlbumList { selected, albums, .. } => (selected, albums.len()),
             Screen::SongList { selected, songs, .. } => (selected, songs.len()),
             Screen::ArtistList { selected, artists } => (selected, artists.len()),
@@ -346,10 +448,6 @@ impl App<'_> {
 
     async fn activate_selection(&mut self, terminal: &mut ratatui::DefaultTerminal) {
         match self.top() {
-            Screen::Menu { selected } => {
-                let selected = *selected;
-                self.enter_menu_item(terminal, selected).await;
-            }
             Screen::AlbumList { albums, selected, .. } => {
                 if let Some(album) = albums.get(*selected).cloned() {
                     self.push_song_list(terminal, album.name.clone(), |c| {
@@ -406,43 +504,6 @@ impl App<'_> {
                     }
                 }
             }
-        }
-    }
-
-    async fn enter_menu_item(&mut self, terminal: &mut ratatui::DefaultTerminal, selected: usize) {
-        match MENU_ITEMS.get(selected).copied() {
-            Some("Albums") => {
-                if let Some(albums) =
-                    self.load(terminal, "Loading albums…", |c| Box::pin(async move { c.albums().await })).await
-                {
-                    self.stack.push(Screen::AlbumList { title: "Albums".into(), albums, selected: 0 });
-                }
-            }
-            Some("Artists") => {
-                if let Some(artists) = self
-                    .load(terminal, "Loading artists…", |c| Box::pin(async move { c.artists().await }))
-                    .await
-                {
-                    self.stack.push(Screen::ArtistList { artists, selected: 0 });
-                }
-            }
-            Some("Playlists") => {
-                if let Some(playlists) = self
-                    .load(terminal, "Loading playlists…", |c| Box::pin(async move { c.playlists().await }))
-                    .await
-                {
-                    self.stack.push(Screen::PlaylistList { playlists, selected: 0 });
-                }
-            }
-            Some("Genres") => {
-                if let Some(genres) = self
-                    .load(terminal, "Loading genres…", |c| Box::pin(async move { c.genres().await }))
-                    .await
-                {
-                    self.stack.push(Screen::GenreList { genres, selected: 0 });
-                }
-            }
-            _ => {}
         }
     }
 
@@ -546,31 +607,23 @@ impl App<'_> {
     }
 
     fn draw_message(&self, frame: &mut Frame) {
-        let para = Paragraph::new(self.message.as_str())
-            .block(Block::default().borders(Borders::ALL).border_style(theme::border()).title(" Maraetai "));
+        let para = Paragraph::new(self.message.as_str()).block(rounded_block(" Maraetai "));
         frame.render_widget(para, frame.area());
     }
 
     fn draw(&self, frame: &mut Frame, now_playing: &NowPlaying) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(6)])
+            .constraints([Constraint::Length(3), Constraint::Min(3), Constraint::Length(6)])
             .split(frame.area());
 
+        self.draw_tab_bar(frame, chunks[0]);
+
         match self.top() {
-            Screen::Menu { selected } => {
-                self.draw_list(
-                    frame,
-                    chunks[0],
-                    " Maraetai — [Enter] open  [/] search  [1] library  [2] queue  [q] quit ",
-                    MENU_ITEMS.iter().map(|s| s.to_string()),
-                    *selected,
-                );
-            }
             Screen::AlbumList { title, albums, selected } => {
                 self.draw_list(
                     frame,
-                    chunks[0],
+                    chunks[1],
                     &format!(" {title} — [Enter] open  [Esc] back "),
                     albums.iter().map(|a| format!("{}  —  {}", a.name, a.artist)),
                     *selected,
@@ -583,7 +636,7 @@ impl App<'_> {
                 });
                 self.draw_song_table(
                     frame,
-                    chunks[0],
+                    chunks[1],
                     &format!(" {title} — [Enter] play from here  [Esc] back "),
                     rows,
                     *selected,
@@ -593,7 +646,7 @@ impl App<'_> {
             Screen::ArtistList { artists, selected } => {
                 self.draw_list(
                     frame,
-                    chunks[0],
+                    chunks[1],
                     " Artists — [Enter] open  [Esc] back ",
                     artists.iter().map(|a| format!("{}  ({} albums)", a.name, a.album_count)),
                     *selected,
@@ -602,7 +655,7 @@ impl App<'_> {
             Screen::PlaylistList { playlists, selected } => {
                 self.draw_list(
                     frame,
-                    chunks[0],
+                    chunks[1],
                     " Playlists — [Enter] open  [Esc] back ",
                     playlists.iter().map(|p| format!("{}  ({} songs)", p.name, p.song_count)),
                     *selected,
@@ -611,7 +664,7 @@ impl App<'_> {
             Screen::GenreList { genres, selected } => {
                 self.draw_list(
                     frame,
-                    chunks[0],
+                    chunks[1],
                     " Genres — [Enter] open  [Esc] back ",
                     genres
                         .iter()
@@ -621,15 +674,15 @@ impl App<'_> {
             }
             Screen::Search { query, editing, results, selected } => {
                 let title = if *editing {
-                    format!(" Search: {query}_  [Enter] run  [Esc] cancel ")
+                    format!(" Search: {query}_  [Enter] run  [Esc] stop editing ")
                 } else {
-                    format!(" Search: {query}  [Enter] play from here  [Esc] back ")
+                    format!(" Search: {query}  [Enter] play from here  [/] new search ")
                 };
                 let rows = results.iter().map(|s| {
                     let (fmt, lossless) = library::format_label(&s.suffix, s.bit_rate);
                     (s.title.as_str(), s.artist.as_str(), s.album.as_str(), s.duration, fmt, lossless)
                 });
-                self.draw_song_table(frame, chunks[0], &title, rows, *selected, &now_playing.title);
+                self.draw_song_table(frame, chunks[1], &title, rows, *selected, &now_playing.title);
             }
             Screen::Queue { tracks, selected } => {
                 let rows = tracks
@@ -637,7 +690,7 @@ impl App<'_> {
                     .map(|(t, a, al, d, fmt, lossless)| (t.as_str(), a.as_str(), al.as_str(), *d, fmt.clone(), *lossless));
                 self.draw_song_table(
                     frame,
-                    chunks[0],
+                    chunks[1],
                     " Queue — [Enter] jump to track  [Esc] back ",
                     rows,
                     *selected,
@@ -646,27 +699,39 @@ impl App<'_> {
             }
         }
 
-        self.draw_status_bar(frame, chunks[1], now_playing);
+        self.draw_status_bar(frame, chunks[2], now_playing);
+    }
+
+    /// The persistent top tab bar — rmpc's signature "always-visible
+    /// navigation", replacing a menu screen you'd otherwise have to enter.
+    fn draw_tab_bar(&self, frame: &mut Frame, area: Rect) {
+        let mut spans = Vec::with_capacity(TABS.len() * 2);
+        for (i, &tab) in TABS.iter().enumerate() {
+            let style = if tab == self.active_tab { theme::active_tab() } else { theme::inactive_tab() };
+            spans.push(Span::styled(format!(" {} {} ", i + 1, tab.label()), style));
+            spans.push(Span::raw(" "));
+        }
+        let para = Paragraph::new(Line::from(spans)).block(rounded_block(""));
+        frame.render_widget(para, area);
     }
 
     fn draw_list(&self, frame: &mut Frame, area: Rect, title: &str, items: impl Iterator<Item = String>, selected: usize) {
         let items: Vec<ListItem> = items.map(ListItem::new).collect();
-        let empty = items.is_empty();
-        let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).border_style(theme::border()).title(title.to_string()))
-            .highlight_style(theme::selected());
+        let len = items.len();
+        let list = List::new(items).block(rounded_block(title.to_string())).highlight_style(theme::selected());
         let mut state = ListState::default();
-        if !empty {
+        if len > 0 {
             state.select(Some(selected));
         }
         frame.render_stateful_widget(list, area, &mut state);
+        self.render_scrollbar(frame, area, len, selected);
     }
 
-    /// Renders a column-aligned track table (Title / Artist / Album / Format
-    /// / Time), cmus-style, with the currently-playing row (matched by
-    /// title — the only stable identifier available client-side)
-    /// highlighted regardless of cursor position. Lossless formats (FLAC,
-    /// ALAC, WAV, ...) are shown in green; lossy ones in the default color.
+    /// Renders a column-aligned track table — Artist / Title / Album /
+    /// Format / Time, duration right-aligned, rmpc's convention — with the
+    /// currently-playing row (matched by title, the only stable identifier
+    /// available client-side) highlighted regardless of cursor position.
+    /// Lossless formats are green; lossy ones use the row's own color.
     fn draw_song_table<'r>(
         &self,
         frame: &mut Frame,
@@ -676,81 +741,85 @@ impl App<'_> {
         selected: usize,
         now_playing_title: &str,
     ) {
-        let mut any = false;
+        let mut len = 0;
         let table_rows: Vec<Row> = rows
             .map(|(t, artist, album, dur, format, lossless)| {
-                any = true;
+                len += 1;
                 let is_playing = !now_playing_title.is_empty() && t == now_playing_title;
                 let row_style = if is_playing { theme::now_playing_row() } else { Style::default() };
-                let format_style = if lossless {
-                    Style::default().fg(Color::Green).add_modifier(ratatui::style::Modifier::BOLD)
-                } else {
-                    row_style
-                };
+                let format_style = if lossless { theme::lossless() } else { row_style };
                 Row::new(vec![
-                    Cell::from(t.to_string()),
                     Cell::from(artist.to_string()),
+                    Cell::from(t.to_string()),
                     Cell::from(album.to_string()),
                     Cell::from(format).style(format_style),
-                    Cell::from(fmt_time(dur)),
+                    Cell::from(Text::from(fmt_time(dur)).alignment(Alignment::Right)),
                 ])
                 .style(row_style)
             })
             .collect();
 
-        let header = Row::new(vec!["Title", "Artist", "Album", "Format", "Time"]).style(theme::header());
+        let header = Row::new(vec!["Artist", "Title", "Album", "Format", "Time"]).style(theme::header());
         let widths = [
-            Constraint::Percentage(36),
             Constraint::Percentage(22),
+            Constraint::Percentage(36),
             Constraint::Percentage(22),
             Constraint::Length(10),
             Constraint::Length(6),
         ];
         let table = Table::new(table_rows, widths)
             .header(header)
-            .block(Block::default().borders(Borders::ALL).border_style(theme::border()).title(title.to_string()))
+            .block(rounded_block(title.to_string()))
             .highlight_style(theme::selected());
 
         let mut state = TableState::default();
-        if any {
+        if len > 0 {
             state.select(Some(selected));
         }
         frame.render_stateful_widget(table, area, &mut state);
+        self.render_scrollbar(frame, area, len, selected);
+    }
+
+    /// A vertical scrollbar drawn over the pane's own right border — a
+    /// small rmpc touch (it themes scrollbars explicitly) that also just
+    /// makes "how much more is there" legible at a glance in a long list.
+    /// Skipped entirely when everything already fits without scrolling
+    /// (a full-height thumb there would just paint over the border for no
+    /// reason), and inset by one row top/bottom so the track doesn't
+    /// collide with the pane's corner glyphs.
+    fn render_scrollbar(&self, frame: &mut Frame, area: Rect, len: usize, position: usize) {
+        let viewport = area.height.saturating_sub(2) as usize;
+        if len == 0 || len <= viewport {
+            return;
+        }
+        let mut state = ScrollbarState::new(len).position(position);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .thumb_style(theme::border());
+        frame.render_stateful_widget(scrollbar, area.inner(Margin { vertical: 1, horizontal: 0 }), &mut state);
     }
 
     fn draw_status_bar(&self, frame: &mut Frame, area: Rect, now_playing: &NowPlaying) {
         // `Block::inner` already accounts for the border on all four sides —
-        // an additional `.margin(1)` on the Layout on top of that left only
-        // 2 rows of space for the 3 requested (Length(1) x3), silently
-        // clipping the gauge/status line. No extra margin needed here.
+        // an additional `.margin(1)` on the Layout on top of that would
+        // leave too little space for the 4 requested rows (found the hard
+        // way once already). No extra margin needed here.
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)])
-            .split(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(theme::border())
-                    .title(" Now Playing ")
-                    .inner(area),
-            );
-        frame.render_widget(
-            Block::default().borders(Borders::ALL).border_style(theme::border()).title(" Now Playing "),
-            area,
-        );
+            .split(rounded_block(" Now Playing ").inner(area));
+        frame.render_widget(rounded_block(" Now Playing "), area);
 
-        // Line 1: track — artist [format], styled like cmus's colored track line.
+        // Line 1: track — artist [format], accent-colored like rmpc's title.
         let track = if now_playing.title.is_empty() { "(nothing loaded)" } else { &now_playing.title };
         let mut spans = vec![Span::styled(track, theme::accent())];
         if !now_playing.artist.is_empty() {
             spans.push(Span::raw("  —  "));
-            spans.push(Span::styled(&now_playing.artist, Style::default().fg(Color::White)));
+            spans.push(Span::raw(now_playing.artist.clone()));
         }
         if !now_playing.format_label.is_empty() {
-            let format_style = if now_playing.lossless {
-                Style::default().fg(Color::Green).add_modifier(ratatui::style::Modifier::BOLD)
-            } else {
-                theme::muted()
-            };
+            let format_style = if now_playing.lossless { theme::lossless() } else { theme::muted() };
             spans.push(Span::raw("   "));
             spans.push(Span::styled(format!("[{}]", now_playing.format_label), format_style));
         }
@@ -765,7 +834,7 @@ impl App<'_> {
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
 
-        // Line 2: a real progress gauge (position/duration), cmus-style.
+        // Line 2: a real progress gauge (position/duration).
         let ratio = if now_playing.duration > 0.0 {
             (now_playing.position / now_playing.duration).clamp(0.0, 1.0)
         } else {
@@ -776,10 +845,7 @@ impl App<'_> {
         } else {
             fmt_time(now_playing.position)
         };
-        let gauge = Gauge::default()
-            .gauge_style(Style::default().fg(Color::Cyan))
-            .ratio(ratio)
-            .label(label);
+        let gauge = Gauge::default().gauge_style(Style::default().fg(Color::Blue)).ratio(ratio).label(label);
         frame.render_widget(gauge, rows[1]);
 
         // Line 3: a real spectrum visualizer — bar heights come from an
@@ -787,19 +853,41 @@ impl App<'_> {
         // daemon/src/visualizer.rs), not a simulated animation.
         frame.render_widget(Paragraph::new(spectrum_line(&now_playing.spectrum)), rows[2]);
 
-        // Line 4: transport state + volume + keybinding hints.
-        let vol_pct = (now_playing.volume * 100.0).round() as i32;
-        let state_line = format!(
-            "{}   vol {vol_pct}%   [space] play/pause  [\u{2190}/\u{2192}] seek  [+/-] volume  [n]ext [p]rev  [s]top  [Q] quit+stop",
-            now_playing.status
-        );
-        frame.render_widget(Paragraph::new(state_line).style(theme::muted()), rows[3]);
+        // Line 4: [state] tag (rmpc's bracketed-yellow convention) + a
+        // compact inline volume slider + keybinding hints.
+        let mut state_spans = vec![
+            Span::styled("[", theme::state_tag()),
+            Span::styled(now_playing.status.to_uppercase(), theme::state_tag()),
+            Span::styled("]", theme::state_tag()),
+            Span::raw("  "),
+            Span::raw(volume_slider(now_playing.volume)),
+            Span::raw("   [space] play/pause  [\u{2190}/\u{2192}] seek  [n]ext [p]rev  [s]top  [Q] quit+stop"),
+        ];
+        for span in &mut state_spans[4..] {
+            span.style = theme::muted().patch(span.style);
+        }
+        frame.render_widget(Paragraph::new(Line::from(state_spans)), rows[3]);
     }
+}
+
+/// A compact inline volume slider — `───●──────  60%`, rmpc's slider
+/// component condensed into the one spare line this layout has for it.
+fn volume_slider(volume: f64) -> String {
+    const WIDTH: usize = 10;
+    // Clamped to WIDTH - 1, not WIDTH: the marker is drawn at index
+    // `filled` inside a 0..WIDTH loop, so leaving it at WIDTH would put
+    // full volume's marker one cell past the visible bar — i.e. nowhere.
+    let filled = ((volume.clamp(0.0, 1.0) * WIDTH as f64).round() as usize).min(WIDTH - 1);
+    let mut bar = String::with_capacity(WIDTH);
+    for i in 0..WIDTH {
+        bar.push(if i == filled { '\u{25cf}' } else { '\u{2500}' });
+    }
+    format!("{bar} {:>3}%", (volume * 100.0).round() as i32)
 }
 
 /// Renders spectrum bar levels as a single line of block characters (one per
 /// bar, so an N-bar spectrum fits in exactly one terminal row regardless of
-/// N) — `▁` for silence up through `█` for the loudest level, cyan and
+/// N) — `▁` for silence up through `█` for the loudest level, blue and
 /// brighter for taller bars so the line has some visual "pop" even in a
 /// screenshot, not just a flat color block.
 fn spectrum_line(levels: &[u8]) -> Line<'static> {
@@ -812,9 +900,9 @@ fn spectrum_line(levels: &[u8]) -> Line<'static> {
         .flat_map(|&level| {
             let idx = (level as usize).min(CHARS.len() - 1);
             let color = if idx >= 6 {
-                Color::LightCyan
+                Color::LightBlue
             } else if idx >= 3 {
-                Color::Cyan
+                Color::Blue
             } else {
                 Color::DarkGray
             };
