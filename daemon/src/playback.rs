@@ -175,6 +175,18 @@ pub enum Command {
     /// playback starts at the first appended track instead (otherwise
     /// "append" would silently do nothing audible).
     AppendQueue(Vec<TrackMeta>),
+    /// Removes one track from the queue by its current index — for the
+    /// TUI's Queue view "remove selected" (`d`). Removing the
+    /// currently-playing track skips to whatever now occupies that slot (or
+    /// stops if the queue becomes empty).
+    RemoveFromQueue(usize),
+    /// Reorders the queue: moves the track at `from` to position `to`,
+    /// shifting everything between them — for the Queue view's "move
+    /// up/down" (`J`/`K`).
+    MoveInQueue { from: usize, to: usize },
+    /// Empties the queue and stops playback — the Queue view's "clear"
+    /// (`D`).
+    ClearQueue,
     Next,
     Previous,
     Pause,
@@ -253,6 +265,15 @@ impl PlaybackHandle {
     }
     pub fn append_queue(&self, tracks: Vec<TrackMeta>) {
         self.send(Command::AppendQueue(tracks));
+    }
+    pub fn remove_from_queue(&self, index: usize) {
+        self.send(Command::RemoveFromQueue(index));
+    }
+    pub fn move_in_queue(&self, from: usize, to: usize) {
+        self.send(Command::MoveInQueue { from, to });
+    }
+    pub fn clear_queue(&self) {
+        self.send(Command::ClearQueue);
     }
     pub fn next(&self) {
         self.send(Command::Next);
@@ -406,6 +427,83 @@ fn run_engine(
                     }
                 }
             }
+            Ok(Command::RemoveFromQueue(remove_index)) => {
+                if remove_index < state.queue.len() {
+                    let removing_current = remove_index == state.index;
+                    state.queue.remove(remove_index);
+                    state.play_order = play_order_after_remove(&state.play_order, remove_index);
+                    if removing_current {
+                        // The playing track is gone — stop it (scrobbling if
+                        // it qualified) and move on to whatever now
+                        // occupies this slot, same transition any other
+                        // track change goes through.
+                        if let Some(sink) = state.sink.take() {
+                            maybe_scrobble_outgoing(&state, sink.get_pos());
+                        }
+                        state.current = None;
+                        if state.queue.is_empty() {
+                            state.index = 0;
+                            state.order_pos = 0;
+                            {
+                                let mut snap = snapshot.lock().expect("poisoned");
+                                snap.queue = Vec::new();
+                                snap.queue_len = 0;
+                                snap.queue_index = 0;
+                                snap.track = None;
+                                snap.spectrum = [0; visualizer::BARS];
+                            }
+                            set_status(&snapshot, &events, Status::Stopped);
+                            let _ = events.send(Event::QueueEnded);
+                        } else {
+                            let next = remove_index.min(state.queue.len() - 1);
+                            start_playback_at(&mut state, &snapshot, &events, next);
+                        }
+                    } else {
+                        if remove_index < state.index {
+                            state.index -= 1;
+                        }
+                        state.order_pos = state.play_order.iter().position(|&i| i == state.index).unwrap_or(0);
+                        let mut snap = snapshot.lock().expect("poisoned");
+                        snap.queue = state.queue.clone();
+                        snap.queue_len = state.queue.len();
+                        snap.queue_index = state.index;
+                    }
+                }
+            }
+            Ok(Command::MoveInQueue { from, to }) => {
+                let len = state.queue.len();
+                if from < len && to < len && from != to {
+                    let track = state.queue.remove(from);
+                    state.queue.insert(to, track);
+                    state.play_order = play_order_after_move(&state.play_order, from, to);
+                    state.index = remap_index_after_move(state.index, from, to);
+                    state.order_pos = state.play_order.iter().position(|&i| i == state.index).unwrap_or(0);
+                    let mut snap = snapshot.lock().expect("poisoned");
+                    snap.queue = state.queue.clone();
+                    snap.queue_index = state.index;
+                }
+            }
+            Ok(Command::ClearQueue) => {
+                if let Some(sink) = state.sink.take() {
+                    maybe_scrobble_outgoing(&state, sink.get_pos());
+                    sink.stop();
+                }
+                state.current = None;
+                state.queue.clear();
+                state.play_order.clear();
+                state.index = 0;
+                state.order_pos = 0;
+                {
+                    let mut snap = snapshot.lock().expect("poisoned");
+                    snap.queue = Vec::new();
+                    snap.queue_len = 0;
+                    snap.queue_index = 0;
+                    snap.track = None;
+                    snap.spectrum = [0; visualizer::BARS];
+                }
+                set_status(&snapshot, &events, Status::Stopped);
+                let _ = events.send(Event::QueueEnded);
+            }
             Ok(Command::PlayAt(index)) => {
                 if index < state.queue.len() {
                     start_playback_at(&mut state, &snapshot, &events, index);
@@ -548,6 +646,38 @@ fn shuffled_play_order(len: usize, shuffle: bool, anchor: Option<usize>) -> Vec<
         order.shuffle(&mut rand::thread_rng());
         order
     }
+}
+
+/// Recomputes `play_order` after removing `queue[removed]` — every entry
+/// that pointed at `removed` is dropped, and every entry pointing past it
+/// shifts down by one, so the existing traversal order (shuffled or not)
+/// survives a single removal instead of being thrown away and reshuffled
+/// from scratch.
+fn play_order_after_remove(order: &[usize], removed: usize) -> Vec<usize> {
+    order.iter().filter(|&&i| i != removed).map(|&i| if i > removed { i - 1 } else { i }).collect()
+}
+
+/// Where a single queue index lands after `queue[from]` moves to position
+/// `to` (everything strictly between shifts one step to close/open the gap)
+/// — the building block behind both `play_order_after_move` (remapping
+/// every entry in the play order) and remapping `state.index` itself.
+fn remap_index_after_move(i: usize, from: usize, to: usize) -> usize {
+    if i == from {
+        to
+    } else if from < to && i > from && i <= to {
+        i - 1
+    } else if to < from && i >= to && i < from {
+        i + 1
+    } else {
+        i
+    }
+}
+
+/// Recomputes `play_order` after moving `queue[from]` to position `to` —
+/// same "preserve the existing order, don't reshuffle" principle as
+/// `play_order_after_remove`.
+fn play_order_after_move(order: &[usize], from: usize, to: usize) -> Vec<usize> {
+    order.iter().map(|&i| remap_index_after_move(i, from, to)).collect()
 }
 
 /// Starts playing `state.queue[index]`, replacing whatever was playing.
@@ -808,6 +938,47 @@ mod tests {
         let mut sorted = order.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn play_order_after_remove_drops_the_removed_entry_and_shifts_greater_ones_down() {
+        // Original order [2, 0, 3, 1]; removing queue index 2 drops that
+        // entry (wherever it appears) and every remaining index greater than
+        // 2 (i.e. 3) shifts down to 2.
+        assert_eq!(play_order_after_remove(&[2, 0, 3, 1], 2), vec![0, 2, 1]);
+    }
+
+    #[test]
+    fn play_order_after_remove_leaves_smaller_indices_untouched() {
+        assert_eq!(play_order_after_remove(&[0, 1, 2, 3], 3), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn remap_index_after_move_forward_shifts_the_gap_closed() {
+        // Moving index 1 to position 3: indices 2 and 3 (between the old and
+        // new slot) shift down by one to fill the gap; 1 itself becomes 3.
+        assert_eq!(remap_index_after_move(1, 1, 3), 3);
+        assert_eq!(remap_index_after_move(2, 1, 3), 1);
+        assert_eq!(remap_index_after_move(3, 1, 3), 2);
+        assert_eq!(remap_index_after_move(0, 1, 3), 0, "untouched index before the move must be unchanged");
+    }
+
+    #[test]
+    fn remap_index_after_move_backward_shifts_the_gap_closed() {
+        // Moving index 3 to position 1: indices 1 and 2 shift up by one to
+        // make room; 3 itself becomes 1.
+        assert_eq!(remap_index_after_move(3, 3, 1), 1);
+        assert_eq!(remap_index_after_move(1, 3, 1), 2);
+        assert_eq!(remap_index_after_move(2, 3, 1), 3);
+        assert_eq!(remap_index_after_move(0, 3, 1), 0);
+    }
+
+    #[test]
+    fn play_order_after_move_is_still_a_full_permutation() {
+        let order = play_order_after_move(&[0, 1, 2, 3, 4], 1, 3);
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 1, 2, 3, 4], "moving must never drop or duplicate an index: {order:?}");
     }
 
     /// Verifies `spawn_scrobble` against `maraetai-service`'s actual

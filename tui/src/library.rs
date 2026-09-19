@@ -40,6 +40,80 @@ pub struct Playlist {
     pub owner: String,
 }
 
+/// One entry of `getArtistInfo2`'s `similarArtist` list. `id` isn't used yet
+/// (the info screen only displays `name`) — kept because it's what a future
+/// "jump to this artist" action would need, and it's part of the real API
+/// shape either way.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SimilarArtist {
+    #[allow(dead_code)]
+    pub id: String,
+    pub name: String,
+}
+
+/// Artist biography + similar-artist recommendations, from OpenSubsonic's
+/// `getArtistInfo2` — a maraetai-service-fronted Navidrome populates this
+/// from its own metadata scan/Last.fm lookup, not something this client
+/// computes. `Default`s to "nothing found" rather than an error, matching
+/// this project's lyrics convention: an older server or an artist with no
+/// info at all looks identical to a request that simply found nothing.
+#[derive(Debug, Clone, Default)]
+pub struct ArtistInfo {
+    /// HTML tags already stripped (see `strip_html`) — safe to render
+    /// directly in the terminal.
+    pub biography: String,
+    pub similar_artists: Vec<SimilarArtist>,
+}
+
+/// Album notes, from OpenSubsonic's `getAlbumInfo2` — same "empty means
+/// nothing found" convention as `ArtistInfo`.
+#[derive(Debug, Clone, Default)]
+pub struct AlbumInfo {
+    /// HTML tags already stripped (see `strip_html`).
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RawArtistInfo {
+    #[serde(default)]
+    biography: String,
+    #[serde(default, rename = "similarArtist")]
+    similar_artist: Vec<SimilarArtist>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RawAlbumInfo {
+    #[serde(default)]
+    notes: String,
+}
+
+/// Strips HTML tags and unescapes the handful of entities that
+/// Last.fm-sourced biography/notes text actually contains (Navidrome passes
+/// that text through close to verbatim, anchor tags and all — the same
+/// "Read more on Last.fm" link every such bio ends with). Hand-rolled rather
+/// than pulling in an HTML parser for what's really just one fixed, simple
+/// shape — same reasoning as `parse_lrc`.
+fn strip_html(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_tag = false;
+    for ch in input.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out.replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .trim()
+        .to_string()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Genre {
     pub value: String,
@@ -341,6 +415,73 @@ impl Client {
         Ok(())
     }
 
+    /// Creates a new playlist with the given name, seeded with `song_ids`
+    /// (empty is fine — a playlist can start with nothing and be built up
+    /// via `add_song_to_playlist`). Returns the new playlist's id, so
+    /// callers like "save the current queue as a playlist" don't need a
+    /// separate `playlists()` round-trip just to find what they made.
+    /// Standard Subsonic `createPlaylist`, passed straight through
+    /// `maraetai-service`'s proxy — no native endpoint involved.
+    pub async fn create_playlist(&self, name: &str, song_ids: &[String]) -> Result<String> {
+        let mut params: Vec<(&str, &str)> = vec![("name", name)];
+        params.extend(song_ids.iter().map(|id| ("songId", id.as_str())));
+        let root = self.get_json("rest/createPlaylist.view", &params).await?;
+        root["playlist"]["id"].as_str().map(String::from).context("createPlaylist response had no playlist id")
+    }
+
+    pub async fn delete_playlist(&self, playlist_id: &str) -> Result<()> {
+        self.get_json("rest/deletePlaylist.view", &[("id", playlist_id)]).await?;
+        Ok(())
+    }
+
+    pub async fn rename_playlist(&self, playlist_id: &str, name: &str) -> Result<()> {
+        self.get_json("rest/updatePlaylist.view", &[("playlistId", playlist_id), ("name", name)]).await?;
+        Ok(())
+    }
+
+    pub async fn add_song_to_playlist(&self, playlist_id: &str, song_id: &str) -> Result<()> {
+        self.get_json("rest/updatePlaylist.view", &[("playlistId", playlist_id), ("songIdToAdd", song_id)]).await?;
+        Ok(())
+    }
+
+    /// Removes one song from a playlist by its position within that
+    /// playlist — Subsonic identifies playlist entries by index rather than
+    /// song id (the same song can appear more than once), via
+    /// `updatePlaylist`'s `songIndexToRemove`. Callers must re-fetch
+    /// `playlist_songs` afterward: every later index has now shifted down
+    /// by one.
+    pub async fn remove_song_from_playlist(&self, playlist_id: &str, song_index: usize) -> Result<()> {
+        let index = song_index.to_string();
+        self.get_json("rest/updatePlaylist.view", &[("playlistId", playlist_id), ("songIndexToRemove", &index)]).await?;
+        Ok(())
+    }
+
+    /// Artist biography + similar artists, from OpenSubsonic's
+    /// `getArtistInfo2` — a `Default` (empty) result, not an error, when the
+    /// server has nothing for this artist (an older server, or simply no
+    /// match found), same convention as `lyrics`.
+    pub async fn artist_info(&self, artist_id: &str) -> Result<ArtistInfo> {
+        let root = self.get_json("rest/getArtistInfo2.view", &[("id", artist_id)]).await?;
+        if root["artistInfo2"].is_null() {
+            return Ok(ArtistInfo::default());
+        }
+        let raw: RawArtistInfo =
+            serde_json::from_value(root["artistInfo2"].clone()).context("unexpected artistInfo2 response shape")?;
+        Ok(ArtistInfo { biography: strip_html(&raw.biography), similar_artists: raw.similar_artist })
+    }
+
+    /// Album notes, from OpenSubsonic's `getAlbumInfo2` — same "empty, not
+    /// an error" convention as `artist_info`.
+    pub async fn album_info(&self, album_id: &str) -> Result<AlbumInfo> {
+        let root = self.get_json("rest/getAlbumInfo2.view", &[("id", album_id)]).await?;
+        if root["albumInfo"].is_null() {
+            return Ok(AlbumInfo::default());
+        }
+        let raw: RawAlbumInfo =
+            serde_json::from_value(root["albumInfo"].clone()).context("unexpected albumInfo response shape")?;
+        Ok(AlbumInfo { notes: strip_html(&raw.notes) })
+    }
+
     /// Fetches lyrics for a track: OpenSubsonic's id-based, potentially
     /// time-synced `getLyricsBySongId` first, falling back to the legacy
     /// artist+title `getLyrics` (parsed as LRC if it looks synced, else
@@ -602,6 +743,112 @@ mod tests {
         client.set_starred("song123", false).await.unwrap();
         let request_line = request.await.unwrap();
         assert!(request_line.starts_with("GET /rest/unstar.view?"), "got: {request_line}");
+    }
+
+    #[tokio::test]
+    async fn create_playlist_sends_name_and_repeated_song_id_params() {
+        let (url, request) = respond_once_capturing(
+            r#"{"subsonic-response":{"status":"ok","playlist":{"id":"pl9","name":"Mix"}}}"#,
+        )
+        .await;
+        let client = Client::new(test_creds(url));
+        let id = client.create_playlist("Mix", &["s1".into(), "s2".into()]).await.unwrap();
+        assert_eq!(id, "pl9");
+        let request_line = request.await.unwrap();
+        assert!(request_line.starts_with("GET /rest/createPlaylist.view?"), "got: {request_line}");
+        assert!(request_line.contains("name=Mix"), "got: {request_line}");
+        assert!(request_line.contains("songId=s1") && request_line.contains("songId=s2"), "got: {request_line}");
+    }
+
+    #[tokio::test]
+    async fn delete_playlist_requests_delete_playlist_view() {
+        let (url, request) = respond_once_capturing(r#"{"subsonic-response":{"status":"ok"}}"#).await;
+        let client = Client::new(test_creds(url));
+        client.delete_playlist("pl9").await.unwrap();
+        let request_line = request.await.unwrap();
+        assert!(request_line.starts_with("GET /rest/deletePlaylist.view?"), "got: {request_line}");
+        assert!(request_line.contains("id=pl9"), "got: {request_line}");
+    }
+
+    #[tokio::test]
+    async fn rename_playlist_sends_playlist_id_and_new_name() {
+        let (url, request) = respond_once_capturing(r#"{"subsonic-response":{"status":"ok"}}"#).await;
+        let client = Client::new(test_creds(url));
+        client.rename_playlist("pl9", "New Name").await.unwrap();
+        let request_line = request.await.unwrap();
+        assert!(request_line.starts_with("GET /rest/updatePlaylist.view?"), "got: {request_line}");
+        assert!(request_line.contains("playlistId=pl9"), "got: {request_line}");
+        assert!(request_line.contains("name=New"), "got: {request_line}");
+    }
+
+    #[tokio::test]
+    async fn add_song_to_playlist_sends_song_id_to_add() {
+        let (url, request) = respond_once_capturing(r#"{"subsonic-response":{"status":"ok"}}"#).await;
+        let client = Client::new(test_creds(url));
+        client.add_song_to_playlist("pl9", "s1").await.unwrap();
+        let request_line = request.await.unwrap();
+        assert!(request_line.contains("playlistId=pl9"), "got: {request_line}");
+        assert!(request_line.contains("songIdToAdd=s1"), "got: {request_line}");
+    }
+
+    #[tokio::test]
+    async fn remove_song_from_playlist_sends_song_index_to_remove() {
+        let (url, request) = respond_once_capturing(r#"{"subsonic-response":{"status":"ok"}}"#).await;
+        let client = Client::new(test_creds(url));
+        client.remove_song_from_playlist("pl9", 2).await.unwrap();
+        let request_line = request.await.unwrap();
+        assert!(request_line.contains("playlistId=pl9"), "got: {request_line}");
+        assert!(request_line.contains("songIndexToRemove=2"), "got: {request_line}");
+    }
+
+    #[tokio::test]
+    async fn parses_real_shaped_artist_info_and_strips_bio_html() {
+        let url = respond_once(
+            r#"{"subsonic-response":{"status":"ok","artistInfo2":{
+                "biography":"A great band from Bristol. &lt;3 <a href=\"http://last.fm\">Read more</a>",
+                "similarArtist":[{"id":"ar2","name":"Tricky"},{"id":"ar3","name":"Portishead"}]
+            }}}"#,
+        )
+        .await;
+        let client = Client::new(test_creds(url));
+        let info = client.artist_info("ar1").await.unwrap();
+        assert_eq!(info.biography, "A great band from Bristol. <3 Read more");
+        assert_eq!(info.similar_artists.len(), 2);
+        assert_eq!(info.similar_artists[0].name, "Tricky");
+    }
+
+    #[tokio::test]
+    async fn missing_artist_info_is_empty_not_an_error() {
+        let url = respond_once(r#"{"subsonic-response":{"status":"ok"}}"#).await;
+        let client = Client::new(test_creds(url));
+        let info = client.artist_info("ar1").await.unwrap();
+        assert!(info.biography.is_empty());
+        assert!(info.similar_artists.is_empty());
+    }
+
+    #[tokio::test]
+    async fn parses_real_shaped_album_info() {
+        let url = respond_once(
+            r#"{"subsonic-response":{"status":"ok","albumInfo":{"notes":"Recorded in 1998."}}}"#,
+        )
+        .await;
+        let client = Client::new(test_creds(url));
+        let info = client.album_info("al1").await.unwrap();
+        assert_eq!(info.notes, "Recorded in 1998.");
+    }
+
+    #[tokio::test]
+    async fn missing_album_info_is_empty_not_an_error() {
+        let url = respond_once(r#"{"subsonic-response":{"status":"ok"}}"#).await;
+        let client = Client::new(test_creds(url));
+        let info = client.album_info("al1").await.unwrap();
+        assert!(info.notes.is_empty());
+    }
+
+    #[test]
+    fn strip_html_removes_tags_and_unescapes_entities() {
+        assert_eq!(strip_html("Tom &amp; Jerry <b>rock</b>"), "Tom & Jerry rock");
+        assert_eq!(strip_html("  padded  "), "padded");
     }
 
     #[tokio::test]

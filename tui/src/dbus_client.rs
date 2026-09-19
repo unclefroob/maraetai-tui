@@ -24,8 +24,18 @@ pub trait Control {
     /// Adds tracks to the end of the queue without interrupting playback —
     /// distinct from `play_queue`, which always replaces the queue.
     async fn append_queue(&self, tracks: Vec<QueueEntry>) -> zbus::Result<()>;
+    /// Removes one track from the queue by its current position.
+    async fn remove_from_queue(&self, index: u32) -> zbus::Result<()>;
+    /// Moves the track at `from` to position `to`, shifting everything
+    /// between them.
+    async fn move_in_queue(&self, from: u32, to: u32) -> zbus::Result<()>;
+    /// Empties the queue and stops playback.
+    async fn clear_queue(&self) -> zbus::Result<()>;
+    /// (title, artist, album, duration_secs, format_label, lossless,
+    /// song_id) per track, in order — `song_id` lets the TUI build a
+    /// playlist straight from the current queue.
     #[allow(clippy::type_complexity)]
-    async fn queue(&self) -> zbus::Result<Vec<(String, String, String, f64, String, bool)>>;
+    async fn queue(&self) -> zbus::Result<Vec<(String, String, String, f64, String, bool, String)>>;
     async fn spectrum(&self) -> zbus::Result<Vec<u8>>;
     async fn next(&self) -> zbus::Result<()>;
     async fn previous(&self) -> zbus::Result<()>;

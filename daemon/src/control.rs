@@ -79,12 +79,14 @@ impl ControlInterface {
     }
 
     /// The full current queue: (title, artist, album, duration_secs,
-    /// format_label, lossless) per track, in order — for a TUI "Queue"
-    /// view. Not a property (like MPRIS's `Metadata`) since it's a list,
-    /// not a single value, and this project doesn't implement MPRIS's
-    /// TrackList interface.
+    /// format_label, lossless, song_id) per track, in order — for a TUI
+    /// "Queue" view. `song_id` trails at the end (added for "save queue as
+    /// playlist") for the same reason it trails on `QueueEntry`: obvious at
+    /// every call site which value is the newer one. Not a property (like
+    /// MPRIS's `Metadata`) since it's a list, not a single value, and this
+    /// project doesn't implement MPRIS's TrackList interface.
     #[allow(clippy::type_complexity)]
-    async fn queue(&self) -> Vec<(String, String, String, f64, String, bool)> {
+    async fn queue(&self) -> Vec<(String, String, String, f64, String, bool, String)> {
         self.playback
             .snapshot()
             .queue
@@ -97,9 +99,29 @@ impl ControlInterface {
                     t.duration.map(|d| d.as_secs_f64()).unwrap_or(0.0),
                     t.format_label,
                     t.lossless,
+                    t.song_id,
                 )
             })
             .collect()
+    }
+
+    /// Removes one track from the queue by its current position — the
+    /// Queue view's "remove selected" (`d`). Removing the currently-playing
+    /// track skips to whatever now occupies that slot.
+    async fn remove_from_queue(&self, index: u32) {
+        self.playback.remove_from_queue(index as usize);
+    }
+
+    /// Reorders the queue, moving the track at `from` to position `to` —
+    /// the Queue view's "move up/down" (`J`/`K`).
+    async fn move_in_queue(&self, from: u32, to: u32) {
+        self.playback.move_in_queue(from as usize, to as usize);
+    }
+
+    /// Empties the queue and stops playback — the Queue view's "clear"
+    /// (`D`).
+    async fn clear_queue(&self) {
+        self.playback.clear_queue();
     }
 
     /// Current spectrum bar levels, `0..=7` each (see `visualizer.rs`) — for

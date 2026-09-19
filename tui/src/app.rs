@@ -30,7 +30,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Gauge, List, ListItem, ListState, Paragraph, Row, Scrollbar,
-    ScrollbarOrientation, ScrollbarState, Table, TableState,
+    ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap,
 };
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
@@ -142,8 +142,11 @@ fn rounded_block(title: impl Into<String>) -> Block<'static> {
 }
 
 /// One entry in the "Queue" view — title/artist/album/duration/format_label/
-/// lossless, as returned by the daemon's `Queue()` method.
-type QueueRow = (String, String, String, f64, String, bool);
+/// lossless/song_id, as returned by the daemon's `Queue()` method. `song_id`
+/// (index `.6`) isn't shown as a column — it's there for actions that need
+/// the underlying Subsonic id: adding the selected track to a playlist, or
+/// building a playlist from the whole queue.
+type QueueRow = (String, String, String, f64, String, bool, String);
 
 /// How many songs `Screen::Home` shows per section before you have to press
 /// `e` to expand it into the full list — enough to glance at, not so many
@@ -196,6 +199,12 @@ enum Screen {
         songs: Vec<Song>,
         selected: usize,
         filter: String,
+        /// `Some(playlist id)` when these songs are a playlist's own
+        /// contents (opened from `PlaylistList`) — `None` for every other
+        /// source (an album, a native list, an expanded Home section).
+        /// Lets `d` mean "remove this song from the playlist" specifically
+        /// here, rather than everywhere a `SongList` is shown.
+        playlist_id: Option<String>,
     },
     ArtistList {
         artists: Vec<Artist>,
@@ -235,6 +244,23 @@ enum Screen {
         sections: Vec<HomeSection>,
         section: usize,
         selected: usize,
+    },
+    /// "Which playlist?" — pushed by `P` ("add to playlist") on top of
+    /// whatever screen the selected song came from; `Enter` adds `song_id`
+    /// to the chosen playlist and pops back to that screen.
+    PlaylistPicker {
+        playlists: Vec<Playlist>,
+        selected: usize,
+        song_id: String,
+    },
+    /// A scrollable block of text — artist biography + similar artists, or
+    /// album notes (`i`, see `App::show_artist_info`/`show_album_info`).
+    /// Generic rather than two separate variants since both are just "some
+    /// text to read," with no other interaction.
+    Info {
+        title: String,
+        body: String,
+        scroll: usize,
     },
 }
 
@@ -319,6 +345,27 @@ struct App<'a> {
     /// Whether the full-screen keybind reference is showing, overlaying
     /// whatever the active tab would otherwise render.
     show_help: bool,
+    /// A single-line text entry overlay for playlist naming — `Some` while
+    /// it's capturing keystrokes, taken (and acted on) when `Enter` submits
+    /// it. One shared field rather than one per action, since only one
+    /// prompt can ever be open at a time.
+    prompt: Option<TextPrompt>,
+}
+
+/// What a submitted `TextPrompt` actually does — see `App::submit_prompt`.
+/// All three variants happen to be playlist actions (the only place this
+/// app needs free-text input); the shared naming reflects that on purpose,
+/// not an accident worth renaming around.
+#[allow(clippy::enum_variant_names)]
+enum PromptAction {
+    NewPlaylist,
+    RenamePlaylist { id: String },
+    SaveQueueAsPlaylist,
+}
+
+struct TextPrompt {
+    action: PromptAction,
+    text: String,
 }
 
 /// One lyrics fetch's result — see `art::Fetched` for why this carries the
@@ -352,6 +399,7 @@ pub async fn run(proxy: ControlProxy<'_>, creds: maraetai_common::Credentials) -
         lyrics_open: false,
         filter_editing: false,
         show_help: false,
+        prompt: None,
     };
 
     app.switch_tab(Tab::Home, &mut terminal).await;
@@ -472,6 +520,10 @@ impl App<'_> {
                 continue;
             }
 
+            if self.prompt.is_some() {
+                self.handle_prompt_key(key.code, terminal).await;
+                continue;
+            }
             if let Screen::Search { editing: true, .. } = self.top() {
                 if self.handle_search_edit(key.code).await {
                     continue;
@@ -556,9 +608,15 @@ impl App<'_> {
                             | Screen::GenreList { .. }
                             | Screen::Queue { .. }
                     );
+                    // Overlays pushed on top of a filterable screen (picking
+                    // a playlist, reading an info panel) shouldn't be
+                    // yanked away to Search either — they're not filterable
+                    // themselves, but jumping tabs out from under one would
+                    // be jarring, not helpful.
+                    let no_op_here = matches!(self.top(), Screen::PlaylistPicker { .. } | Screen::Info { .. });
                     if filterable {
                         self.filter_editing = true;
-                    } else {
+                    } else if !no_op_here {
                         self.switch_tab(Tab::Search, terminal).await;
                     }
                 }
@@ -570,6 +628,30 @@ impl App<'_> {
                 // flips regardless, so it's already open the next time
                 // something starts playing.
                 KeyCode::Char('l') => self.lyrics_open = !self.lyrics_open,
+                // Add the selected song to a playlist — works from any
+                // screen that shows songs (SongList, Search, Home, Queue).
+                KeyCode::Char('P') => self.open_playlist_picker(terminal).await,
+                // New playlist (Playlists tab only).
+                KeyCode::Char('N') => self.prompt_new_playlist(),
+                // Rename the selected playlist (Playlists tab only).
+                KeyCode::Char('c') => self.prompt_rename_playlist(),
+                // Context-sensitive delete: a playlist itself
+                // (PlaylistList), a song within one (a playlist's
+                // SongList), or a track from the queue (Queue) — see
+                // `delete_selected`.
+                KeyCode::Char('d') => self.delete_selected(terminal).await,
+                // Clears the entire queue (Queue only) — the "bigger"
+                // version of `d`, same shift-for-more-consequential
+                // convention as `Q` next to `q`.
+                KeyCode::Char('D') => self.clear_queue(terminal).await,
+                // Moves the selected queue track down/up one position
+                // (Queue only).
+                KeyCode::Char('J') => self.move_queue_item(terminal, 1).await,
+                KeyCode::Char('K') => self.move_queue_item(terminal, -1).await,
+                // Saves the current queue as a new playlist (Queue only).
+                KeyCode::Char('S') => self.prompt_save_queue_as_playlist(),
+                // Artist biography + similar artists, or album notes.
+                KeyCode::Char('i') => self.show_info(terminal).await,
                 KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
                 KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
                 KeyCode::Enter => self.activate_selection(terminal).await,
@@ -834,7 +916,13 @@ impl App<'_> {
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<Song>>> + '_>>,
     ) {
         let songs = self.load(terminal, &format!("Loading {title}…"), fetch).await.unwrap_or_default();
-        self.stack.push(Screen::SongList { title: title.to_string(), songs, selected: 0, filter: String::new() });
+        self.stack.push(Screen::SongList {
+            title: title.to_string(),
+            songs,
+            selected: 0,
+            filter: String::new(),
+            playlist_id: None,
+        });
     }
 
     /// Handles a key while a search query is being typed. Returns `true` if
@@ -891,6 +979,63 @@ impl App<'_> {
         consumed
     }
 
+    /// Handles a key while `self.prompt` is capturing keystrokes — typing
+    /// extends the text, `Backspace` shortens it, `Esc` cancels, and
+    /// `Enter` submits (via `submit_prompt`) as long as the trimmed text
+    /// isn't empty. Every other key is swallowed: a prompt is modal, so
+    /// nothing underneath should react to the same keystroke.
+    async fn handle_prompt_key(&mut self, code: KeyCode, terminal: &mut ratatui::DefaultTerminal) {
+        let Some(prompt) = &mut self.prompt else { return };
+        match code {
+            KeyCode::Char(c) => prompt.text.push(c),
+            KeyCode::Backspace => {
+                prompt.text.pop();
+            }
+            KeyCode::Esc => self.prompt = None,
+            KeyCode::Enter => {
+                let prompt = self.prompt.take().expect("checked above");
+                let name = prompt.text.trim().to_string();
+                if !name.is_empty() {
+                    self.submit_prompt(prompt.action, name, terminal).await;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Carries out whatever a submitted `TextPrompt` was for — see
+    /// `PromptAction`.
+    async fn submit_prompt(&mut self, action: PromptAction, name: String, terminal: &mut ratatui::DefaultTerminal) {
+        match action {
+            PromptAction::NewPlaylist => match self.library.create_playlist(&name, &[]).await {
+                Ok(_) => {
+                    self.message = format!("created playlist \"{name}\"");
+                    self.switch_tab(Tab::Playlists, terminal).await;
+                }
+                Err(e) => self.message = format!("could not create playlist: {e}"),
+            },
+            PromptAction::RenamePlaylist { id } => match self.library.rename_playlist(&id, &name).await {
+                Ok(()) => {
+                    self.message = format!("renamed to \"{name}\"");
+                    self.switch_tab(Tab::Playlists, terminal).await;
+                }
+                Err(e) => self.message = format!("could not rename playlist: {e}"),
+            },
+            PromptAction::SaveQueueAsPlaylist => {
+                let Screen::Queue { tracks, .. } = self.top() else { return };
+                let song_ids: Vec<String> = tracks.iter().map(|t| t.6.clone()).filter(|id| !id.is_empty()).collect();
+                if song_ids.is_empty() {
+                    self.message = "queue has no saveable tracks".to_string();
+                    return;
+                }
+                match self.library.create_playlist(&name, &song_ids).await {
+                    Ok(_) => self.message = format!("saved queue as playlist \"{name}\""),
+                    Err(e) => self.message = format!("could not save playlist: {e}"),
+                }
+            }
+        }
+    }
+
     /// Indices into the top screen's underlying list that match its current
     /// `filter` (case-insensitive substring, matched against whatever text
     /// that screen already shows) — empty filter matches everything.
@@ -932,8 +1077,9 @@ impl App<'_> {
                 .collect(),
             Screen::Search { results, .. } => (0..results.len()).collect(),
             // Home has its own dedicated cursor/navigation instead (see
-            // `home_move_selection`).
-            Screen::Home { .. } => Vec::new(),
+            // `home_move_selection`); the picker and info screens have
+            // their own equally simple movement (see `move_selection`).
+            Screen::Home { .. } | Screen::PlaylistPicker { .. } | Screen::Info { .. } => Vec::new(),
         }
     }
 
@@ -949,6 +1095,21 @@ impl App<'_> {
             }
             Some(Screen::Home { sections, section, selected }) => {
                 home_move_selection(sections, section, selected, delta);
+                return;
+            }
+            // A plain wrapping list, same as the generic path below, but
+            // written out here since `PlaylistPicker` has no `filter` field
+            // to match the generic path's pattern.
+            Some(Screen::PlaylistPicker { selected, playlists, .. }) => {
+                if !playlists.is_empty() {
+                    *selected = (*selected as i32 + delta).rem_euclid(playlists.len() as i32) as usize;
+                }
+                return;
+            }
+            // Scrolls a line count, same convention Lyrics used to use
+            // before it became a panel.
+            Some(Screen::Info { scroll, .. }) => {
+                *scroll = (*scroll as i32 + delta).max(0) as usize;
                 return;
             }
             _ => {}
@@ -991,11 +1152,21 @@ impl App<'_> {
             }
             return;
         }
+        if let Screen::PlaylistPicker { playlists, selected, song_id } = self.top() {
+            let Some(playlist) = playlists.get(*selected).cloned() else { return };
+            let song_id = song_id.clone();
+            match self.library.add_song_to_playlist(&playlist.id, &song_id).await {
+                Ok(()) => self.message = format!("added to \"{}\"", playlist.name),
+                Err(e) => self.message = format!("could not add to playlist: {e}"),
+            }
+            self.stack.pop();
+            return;
+        }
         let visible = self.visible_indices();
         match self.top() {
             Screen::AlbumList { albums, selected, .. } => {
                 let Some(album) = visible.get(*selected).and_then(|&i| albums.get(i)).cloned() else { return };
-                self.push_song_list(terminal, album.name.clone(), |c| {
+                self.push_song_list(terminal, album.name.clone(), None, |c| {
                     let id = album.id.clone();
                     Box::pin(async move { c.album_songs(&id).await })
                 })
@@ -1011,7 +1182,7 @@ impl App<'_> {
             }
             Screen::PlaylistList { playlists, selected, .. } => {
                 let Some(pl) = visible.get(*selected).and_then(|&i| playlists.get(i)).cloned() else { return };
-                self.push_song_list(terminal, pl.name.clone(), |c| {
+                self.push_song_list(terminal, pl.name.clone(), Some(pl.id.clone()), |c| {
                     let id = pl.id.clone();
                     Box::pin(async move { c.playlist_songs(&id).await })
                 })
@@ -1041,8 +1212,9 @@ impl App<'_> {
                 }
             }
             // Handled above (Search's own indexing; Home plays from its
-            // capped preview).
-            Screen::Search { .. } | Screen::Home { .. } => {}
+            // capped preview; PlaylistPicker adds and pops). Info has
+            // nothing to activate.
+            Screen::Search { .. } | Screen::Home { .. } | Screen::PlaylistPicker { .. } | Screen::Info { .. } => {}
         }
     }
 
@@ -1078,6 +1250,244 @@ impl App<'_> {
                 })
                 .await;
             }
+        }
+    }
+
+    /// The Subsonic song id under the cursor on whichever screen is on top,
+    /// if that screen shows songs at all — used by `P` ("add to
+    /// playlist"), which only needs an id, not a full `Song` (so it also
+    /// works from the Queue view, which only carries display strings + an
+    /// id, not full library metadata).
+    fn selected_song_id(&self) -> Option<String> {
+        let home_section = if let Screen::Home { section, .. } = self.top() { Some(*section) } else { None };
+        let visible = self.visible_indices();
+        match self.top() {
+            Screen::Home { sections, selected, .. } => {
+                sections.get(home_section?)?.songs.get(*selected).map(|s| s.id.clone())
+            }
+            Screen::SongList { songs, selected, .. } => {
+                visible.get(*selected).and_then(|&i| songs.get(i)).map(|s| s.id.clone())
+            }
+            Screen::Search { results, selected, editing, .. } if !*editing => {
+                visible.get(*selected).and_then(|&i| results.get(i)).map(|s| s.id.clone())
+            }
+            Screen::Queue { tracks, selected, .. } => visible.get(*selected).and_then(|&i| tracks.get(i)).map(|t| t.6.clone()),
+            _ => None,
+        }
+    }
+
+    /// `P`: opens a "which playlist?" picker for the selected song — pushed
+    /// on top of whatever screen it's called from, popped again once
+    /// `activate_selection` adds the song (or `Esc` cancels). A no-op with
+    /// nothing selectable, or if the user has no playlists yet to add to.
+    async fn open_playlist_picker(&mut self, terminal: &mut ratatui::DefaultTerminal) {
+        let Some(song_id) = self.selected_song_id() else { return };
+        let playlists = self.load(terminal, "Loading playlists…", |c| Box::pin(async move { c.playlists().await })).await.unwrap_or_default();
+        if playlists.is_empty() {
+            self.message = "no playlists yet — press N on the Playlists tab to create one".to_string();
+            return;
+        }
+        self.stack.push(Screen::PlaylistPicker { playlists, selected: 0, song_id });
+    }
+
+    /// `N`: opens the "new playlist" name prompt — Playlists tab only.
+    fn prompt_new_playlist(&mut self) {
+        if !matches!(self.top(), Screen::PlaylistList { .. }) {
+            return;
+        }
+        self.prompt = Some(TextPrompt { action: PromptAction::NewPlaylist, text: String::new() });
+    }
+
+    /// `c`: opens the "rename playlist" prompt, pre-filled with the
+    /// selected playlist's current name — Playlists tab only.
+    fn prompt_rename_playlist(&mut self) {
+        let Screen::PlaylistList { playlists, selected, .. } = self.top() else { return };
+        let visible = self.visible_indices();
+        let Some(pl) = visible.get(*selected).and_then(|&i| playlists.get(i)) else { return };
+        self.prompt = Some(TextPrompt { action: PromptAction::RenamePlaylist { id: pl.id.clone() }, text: pl.name.clone() });
+    }
+
+    /// `S`: opens the "save as playlist" name prompt for the current queue
+    /// — Queue view only.
+    fn prompt_save_queue_as_playlist(&mut self) {
+        if !matches!(self.top(), Screen::Queue { .. }) {
+            return;
+        }
+        self.prompt = Some(TextPrompt { action: PromptAction::SaveQueueAsPlaylist, text: String::new() });
+    }
+
+    /// `d`: deletes the selected item from wherever it currently is — a
+    /// playlist itself (`PlaylistList`), a song within one (a playlist's
+    /// `SongList`, see `Screen::SongList::playlist_id`), or a track from
+    /// the queue (`Queue`). A no-op everywhere else, since "delete" only
+    /// means something in these three specific contexts.
+    async fn delete_selected(&mut self, terminal: &mut ratatui::DefaultTerminal) {
+        let visible = self.visible_indices();
+        match self.top() {
+            Screen::PlaylistList { playlists, selected, .. } => {
+                let Some(pl) = visible.get(*selected).and_then(|&i| playlists.get(i)).cloned() else { return };
+                match self.library.delete_playlist(&pl.id).await {
+                    Ok(()) => {
+                        self.message = format!("deleted playlist \"{}\"", pl.name);
+                        self.switch_tab(Tab::Playlists, terminal).await;
+                    }
+                    Err(e) => self.message = format!("could not delete playlist: {e}"),
+                }
+            }
+            Screen::SongList { playlist_id: Some(playlist_id), selected, .. } => {
+                let Some(&real) = visible.get(*selected) else { return };
+                let playlist_id = playlist_id.clone();
+                match self.library.remove_song_from_playlist(&playlist_id, real).await {
+                    Ok(()) => {
+                        self.message = "removed from playlist".to_string();
+                        self.refresh_playlist_songs(terminal, &playlist_id).await;
+                    }
+                    Err(e) => self.message = format!("could not remove from playlist: {e}"),
+                }
+            }
+            Screen::Queue { selected, .. } => {
+                let Some(&real) = visible.get(*selected) else { return };
+                match self.proxy.remove_from_queue(real as u32).await {
+                    Ok(()) => self.refresh_queue(terminal).await,
+                    Err(e) => self.message = format!("could not remove from queue: {e}"),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `D`: empties the entire queue — Queue view only, the "bigger"
+    /// counterpart to `d`'s single-track removal there.
+    async fn clear_queue(&mut self, terminal: &mut ratatui::DefaultTerminal) {
+        if !matches!(self.top(), Screen::Queue { .. }) {
+            return;
+        }
+        match self.proxy.clear_queue().await {
+            Ok(()) => self.refresh_queue(terminal).await,
+            Err(e) => self.message = format!("could not clear queue: {e}"),
+        }
+    }
+
+    /// `J`/`K`: moves the selected queue track down/up one position within
+    /// the *actual* (unfiltered) queue — Queue view only, and a no-op at
+    /// either edge.
+    async fn move_queue_item(&mut self, terminal: &mut ratatui::DefaultTerminal, delta: i32) {
+        let Screen::Queue { selected, .. } = self.top() else { return };
+        let visible = self.visible_indices();
+        let Some(&real) = visible.get(*selected) else { return };
+        let queue_len = match self.top() {
+            Screen::Queue { tracks, .. } => tracks.len(),
+            _ => return,
+        };
+        let new_real = real as i32 + delta;
+        if new_real < 0 || new_real as usize >= queue_len {
+            return;
+        }
+        let new_real = new_real as usize;
+        if let Err(e) = self.proxy.move_in_queue(real as u32, new_real as u32).await {
+            self.message = format!("could not reorder queue: {e}");
+            return;
+        }
+        self.refresh_queue(terminal).await;
+        // The moved track is now at `new_real` — follow it with the cursor
+        // rather than leaving the selection pointing at whatever else
+        // shifted into the old slot.
+        let visible_after = self.visible_indices();
+        if let Some(pos) = visible_after.iter().position(|&i| i == new_real) {
+            if let Some(Screen::Queue { selected: sel, .. }) = self.stack.last_mut() {
+                *sel = pos;
+            }
+        }
+    }
+
+    /// Fetches the current queue, showing a loading message meanwhile —
+    /// shared by `switch_tab`'s `Tab::Queue` arm (a fresh push) and
+    /// `refresh_queue` (an in-place update after a mutation).
+    async fn fetch_queue(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Vec<QueueRow> {
+        self.message = "Loading queue…".to_string();
+        let _ = terminal.draw(|f| self.draw_message(f));
+        match self.proxy.queue().await {
+            Ok(tracks) => {
+                self.message.clear();
+                tracks
+            }
+            Err(e) => {
+                self.message = format!("error: {e}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Re-fetches the queue and updates the top-of-stack `Queue` screen in
+    /// place (not pushed as a new drill-down level) — used after any
+    /// mutation (`d`/`D`/`J`/`K`) that changes the queue's contents or
+    /// order. Keeps the cursor's *position* rather than the specific track
+    /// it was on — callers that need to follow a specific track (like
+    /// `move_queue_item`) fix the selection up afterward.
+    async fn refresh_queue(&mut self, terminal: &mut ratatui::DefaultTerminal) {
+        let Some(Screen::Queue { selected, .. }) = self.stack.last() else { return };
+        let selected = *selected;
+        let tracks = self.fetch_queue(terminal).await;
+        let new_len = tracks.len();
+        if let Some(Screen::Queue { tracks: t, selected: sel, .. }) = self.stack.last_mut() {
+            *t = tracks;
+            *sel = selected.min(new_len.saturating_sub(1));
+        }
+    }
+
+    /// Re-fetches one playlist's songs and updates the top-of-stack
+    /// `SongList` in place — used after `d` removes a song from it (every
+    /// later index has shifted down by one).
+    async fn refresh_playlist_songs(&mut self, terminal: &mut ratatui::DefaultTerminal, playlist_id: &str) {
+        let Some(Screen::SongList { selected, .. }) = self.stack.last() else { return };
+        let selected = *selected;
+        let id = playlist_id.to_string();
+        let songs = self.load(terminal, "Loading…", |c| Box::pin(async move { c.playlist_songs(&id).await })).await.unwrap_or_default();
+        let new_len = songs.len();
+        if let Some(Screen::SongList { songs: s, selected: sel, .. }) = self.stack.last_mut() {
+            *s = songs;
+            *sel = selected.min(new_len.saturating_sub(1));
+        }
+    }
+
+    /// `i`: shows artist biography + similar artists (`ArtistList`) or
+    /// album notes (`AlbumList`) in a scrollable `Screen::Info` — a no-op
+    /// anywhere else.
+    async fn show_info(&mut self, terminal: &mut ratatui::DefaultTerminal) {
+        match self.top() {
+            Screen::ArtistList { artists, selected, .. } => {
+                let visible = self.visible_indices();
+                let Some(artist) = visible.get(*selected).and_then(|&i| artists.get(i)).cloned() else { return };
+                let info = self
+                    .load(terminal, &format!("Loading info for {}…", artist.name), |c| {
+                        let id = artist.id.clone();
+                        Box::pin(async move { c.artist_info(&id).await })
+                    })
+                    .await
+                    .unwrap_or_default();
+                let mut body = if info.biography.is_empty() { "No biography available.".to_string() } else { info.biography };
+                if !info.similar_artists.is_empty() {
+                    body.push_str("\n\nSimilar artists:\n");
+                    for s in &info.similar_artists {
+                        body.push_str(&format!(" - {}\n", s.name));
+                    }
+                }
+                self.stack.push(Screen::Info { title: artist.name, body, scroll: 0 });
+            }
+            Screen::AlbumList { albums, selected, .. } => {
+                let visible = self.visible_indices();
+                let Some(album) = visible.get(*selected).and_then(|&i| albums.get(i)).cloned() else { return };
+                let info = self
+                    .load(terminal, &format!("Loading info for {}…", album.name), |c| {
+                        let id = album.id.clone();
+                        Box::pin(async move { c.album_info(&id).await })
+                    })
+                    .await
+                    .unwrap_or_default();
+                let body = if info.notes.is_empty() { "No notes available.".to_string() } else { info.notes };
+                self.stack.push(Screen::Info { title: album.name, body, scroll: 0 });
+            }
+            _ => {}
         }
     }
 
@@ -1194,12 +1604,13 @@ impl App<'_> {
         &mut self,
         terminal: &mut ratatui::DefaultTerminal,
         title: String,
+        playlist_id: Option<String>,
         fetch: impl FnOnce(
             &library::Client,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<Song>>> + '_>>,
     ) {
         if let Some(songs) = self.load(terminal, &format!("Loading {title}…"), fetch).await {
-            self.stack.push(Screen::SongList { title, songs, selected: 0, filter: String::new() });
+            self.stack.push(Screen::SongList { title, songs, selected: 0, filter: String::new(), playlist_id });
         }
     }
 
@@ -1308,13 +1719,18 @@ impl App<'_> {
                 let items = visible.iter().map(|&i| format!("{}  —  {}", albums[i].name, albums[i].artist));
                 self.draw_list(frame, chunks[1], &filter_hint_title(title, filter, self.filter_editing, "[Enter] open  [Esc] back"), items, *selected);
             }
-            Screen::SongList { title, songs, selected, filter } => {
+            Screen::SongList { title, songs, selected, filter, playlist_id } => {
                 let rows = visible.iter().map(|&i| {
                     let s = &songs[i];
                     let (fmt, lossless) = library::format_label(&s.suffix, s.bit_rate);
                     (s.title.as_str(), s.artist.as_str(), s.album.as_str(), s.duration, fmt, lossless, s.is_starred())
                 });
-                let title = filter_hint_title(title, filter, self.filter_editing, "[Enter] play  [a]dd  [f]avorite  [Esc] back");
+                let hint = if playlist_id.is_some() {
+                    "[Enter] play  [a]dd  [f]avorite  [P]laylist  [d]elete  [Esc] back"
+                } else {
+                    "[Enter] play  [a]dd  [f]avorite  [P]laylist  [Esc] back"
+                };
+                let title = filter_hint_title(title, filter, self.filter_editing, hint);
                 self.draw_song_table(frame, chunks[1], &title, rows, *selected, &now_playing.title);
             }
             Screen::ArtistList { artists, selected, filter } => {
@@ -1352,14 +1768,22 @@ impl App<'_> {
             }
             Screen::Queue { tracks, selected, filter } => {
                 let rows = visible.iter().map(|&i| {
-                    let (t, a, al, d, fmt, lossless) = &tracks[i];
+                    let (t, a, al, d, fmt, lossless, _song_id) = &tracks[i];
                     (t.as_str(), a.as_str(), al.as_str(), *d, fmt.clone(), *lossless, false)
                 });
-                let title = filter_hint_title("Queue", filter, self.filter_editing, "[Enter] jump to track  [Esc] back");
+                let hint = "[Enter] jump  [J/K] move  [d]elete  [D] clear  [S]ave as playlist  [P]laylist  [Esc] back";
+                let title = filter_hint_title("Queue", filter, self.filter_editing, hint);
                 self.draw_song_table(frame, chunks[1], &title, rows, *selected, &now_playing.title);
             }
             Screen::Home { sections, section, selected } => {
                 self.draw_home(frame, chunks[1], sections, *section, *selected);
+            }
+            Screen::PlaylistPicker { playlists, selected, .. } => {
+                let items = playlists.iter().map(|p| format!("{}  ({} songs)", p.name, p.song_count));
+                self.draw_list(frame, chunks[1], " Add to playlist — [Enter] add  [Esc] cancel ", items, *selected);
+            }
+            Screen::Info { title, body, scroll } => {
+                self.draw_info(frame, chunks[1], title, body, *scroll);
             }
         }
 
@@ -1381,6 +1805,14 @@ impl App<'_> {
             ("f", "toggle favorite on the selected song"),
             ("e", "expand a Home section into its full list"),
             ("l", "toggle the lyrics panel (while something's playing)"),
+            ("i", "artist bio / album notes (Artists, Albums)"),
+            ("P", "add the selected song to a playlist"),
+            ("N", "new playlist (Playlists)"),
+            ("c", "rename the selected playlist (Playlists)"),
+            ("d", "delete: a playlist, a song in one, or a queue track"),
+            ("D", "clear the entire queue (Queue)"),
+            ("J / K", "move the selected queue track down / up (Queue)"),
+            ("S", "save the current queue as a playlist (Queue)"),
             ("/", "filter this list (Esc clears it)"),
             ("Esc / Backspace", "clear filter, then back"),
             ("space", "play / pause"),
@@ -1547,6 +1979,18 @@ impl App<'_> {
                 .collect();
             frame.render_widget(List::new(items).block(rounded_block(title)), chunks[i]);
         }
+    }
+
+    /// A scrollable block of plain text — artist biography/similar artists
+    /// or album notes (`i`, see `App::show_info`). Wrapped rather than
+    /// truncated, since biography text is prose, not a fixed-width table
+    /// row.
+    fn draw_info(&self, frame: &mut Frame, area: Rect, title: &str, body: &str, scroll: usize) {
+        let block = rounded_block(format!(" {title} — [Up/Down] scroll  [Esc] back "));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let paragraph = Paragraph::new(body.to_string()).wrap(Wrap { trim: false }).scroll((scroll as u16, 0));
+        frame.render_widget(paragraph, inner);
     }
 
     /// Renders whatever's in `self.lyrics` for the current track, in the
