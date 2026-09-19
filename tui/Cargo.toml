@@ -25,3 +25,4 @@ crossterm = "0.28"
 rpassword = "7"
 urlencoding = "2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+ratatui-image = { version = "=2.0.1", default-features = false, features = ["crossterm", "rustix"] }

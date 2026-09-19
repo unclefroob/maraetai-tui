@@ -32,6 +32,9 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Gauge, List, ListItem, ListState, Paragraph, Row, Scrollbar,
     ScrollbarOrientation, ScrollbarState, Table, TableState,
 };
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::StatefulProtocol;
+use ratatui_image::{Resize, StatefulImage};
 use tokio::sync::mpsc;
 
 use crate::art;
@@ -45,25 +48,26 @@ const VOLUME_STEP: f64 = 0.05;
 /// The persistent top-level tabs — always visible, switched with `1`-`6`
 /// (rmpc itself uses configurable keys per tab; fixed number keys are a
 /// reasonable single-user default here). `Search` and `Queue` are tabs like
-/// any other, not special-cased screens.
+/// any other, not special-cased screens. Playlists leads since it's the
+/// most common starting point (a saved playlist beats rebrowsing albums).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
+    Playlists,
     Albums,
     Artists,
-    Playlists,
     Genres,
     Search,
     Queue,
 }
 
-const TABS: [Tab; 6] = [Tab::Albums, Tab::Artists, Tab::Playlists, Tab::Genres, Tab::Search, Tab::Queue];
+const TABS: [Tab; 6] = [Tab::Playlists, Tab::Albums, Tab::Artists, Tab::Genres, Tab::Search, Tab::Queue];
 
 impl Tab {
     fn label(self) -> &'static str {
         match self {
+            Tab::Playlists => "Playlists",
             Tab::Albums => "Albums",
             Tab::Artists => "Artists",
-            Tab::Playlists => "Playlists",
             Tab::Genres => "Genres",
             Tab::Search => "Search",
             Tab::Queue => "Queue",
@@ -199,30 +203,37 @@ struct App<'a> {
     /// via a small conversion at the call site, avoiding refetching the same
     /// track's art every 250ms poll tick.
     current_art_url: Option<String>,
-    /// Rendered art for `current_art_url`, once its background fetch
-    /// completes. `None` shows `art::placeholder()` instead — while
-    /// fetching, or when there's simply no art to show.
-    art_lines: Option<Vec<Line<'static>>>,
+    /// Built from the decoded image once its background fetch completes,
+    /// via `picker.new_resize_protocol` — `None` shows `art::placeholder()`
+    /// instead, while fetching or when there's simply no art to show.
+    art_protocol: Option<Box<dyn StatefulProtocol>>,
+    /// Detects the terminal's real graphics-protocol support once at
+    /// startup (Kitty/Sixel/iTerm2, falling back to half-blocks) — see
+    /// `art::make_picker`. `new_resize_protocol` needs `&mut self` on this,
+    /// which is why `draw`/`draw_status_bar` take `&mut self` too.
+    picker: Picker,
     art_tx: mpsc::UnboundedSender<art::Fetched>,
     art_rx: mpsc::UnboundedReceiver<art::Fetched>,
 }
 
 pub async fn run(proxy: ControlProxy<'_>, creds: maraetai_common::Credentials) -> Result<()> {
     let (art_tx, art_rx) = mpsc::unbounded_channel();
+    let mut terminal = ratatui::init();
+    let picker = art::make_picker();
     let mut app = App {
         proxy,
         library: library::Client::new(creds),
-        active_tab: Tab::Albums,
+        active_tab: Tab::Playlists,
         stack: Vec::new(),
         message: String::new(),
+        picker,
         current_art_url: None,
-        art_lines: None,
+        art_protocol: None,
         art_tx,
         art_rx,
     };
 
-    let mut terminal = ratatui::init();
-    app.switch_tab(Tab::Albums, &mut terminal).await;
+    app.switch_tab(Tab::Playlists, &mut terminal).await;
     let result = app.event_loop(&mut terminal).await;
     ratatui::restore();
     result
@@ -376,7 +387,7 @@ impl App<'_> {
         let new_url = (!now_playing.art_url.is_empty()).then(|| now_playing.art_url.clone());
         if new_url != self.current_art_url {
             self.current_art_url = new_url.clone();
-            self.art_lines = None;
+            self.art_protocol = None;
             if let Some(url) = new_url {
                 art::spawn_fetch(url, self.art_tx.clone());
             }
@@ -385,7 +396,7 @@ impl App<'_> {
             // Guards against a fetch for a track the user has since skipped
             // past arriving late and clobbering the *current* track's art.
             if self.current_art_url.as_deref() == Some(fetched.url.as_str()) {
-                self.art_lines = Some(fetched.lines);
+                self.art_protocol = Some(self.picker.new_resize_protocol(fetched.image));
             }
         }
     }
@@ -663,12 +674,11 @@ impl App<'_> {
         frame.render_widget(para, frame.area());
     }
 
-    fn draw(&self, frame: &mut Frame, now_playing: &NowPlaying) {
-        // Now-playing panel: 2 border rows + `art::HEIGHT` content rows —
-        // title/gauge/spectrum/state on the right are laid out to add up to
-        // exactly that same height (see `draw_status_bar`), so the panel is
-        // exactly as tall as the album art needs and no taller.
-        let now_playing_height = art::HEIGHT + 2;
+    fn draw(&mut self, frame: &mut Frame, now_playing: &NowPlaying) {
+        // Now-playing panel: 2 border rows + `art::HEIGHT` (art + compact
+        // track info beside it) + `spectrum::ROWS` (full-width visualizer)
+        // + 1 (state line) — see `draw_status_bar`.
+        let now_playing_height = art::HEIGHT + spectrum::ROWS as u16 + 1 + 2;
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(3), Constraint::Min(3), Constraint::Length(now_playing_height)])
@@ -857,7 +867,7 @@ impl App<'_> {
         frame.render_stateful_widget(scrollbar, area.inner(Margin { vertical: 1, horizontal: 0 }), &mut state);
     }
 
-    fn draw_status_bar(&self, frame: &mut Frame, area: Rect, now_playing: &NowPlaying) {
+    fn draw_status_bar(&mut self, frame: &mut Frame, area: Rect, now_playing: &NowPlaying) {
         // `Block::inner` already accounts for the border on all four sides —
         // an additional `.margin(1)` on the Layout on top of that would
         // leave too little space for the requested rows (found the hard way
@@ -865,28 +875,44 @@ impl App<'_> {
         let inner = rounded_block(" Now Playing ").inner(area);
         frame.render_widget(rounded_block(" Now Playing "), area);
 
-        // Album art on the left, track info/gauge/spectrum/state on the
-        // right — `art::WIDTH + 2` gives it one column of breathing room on
-        // each side rather than butting straight up against the border and
-        // the info column.
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(art::WIDTH + 2), Constraint::Min(20)])
-            .split(inner);
-        let art_lines = self.art_lines.clone().unwrap_or_else(art::placeholder);
-        frame.render_widget(Paragraph::new(art_lines).alignment(Alignment::Center), cols[0]);
-
-        let rows = Layout::default()
+        // Top-to-bottom: [art + compact track info, side by side] then the
+        // spectrum and state line, both spanning the *entire* panel width
+        // rather than being squeezed into the space beside the art.
+        let sections = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),
-                Constraint::Length(1),
+                Constraint::Length(art::HEIGHT),
                 Constraint::Length(spectrum::ROWS as u16),
                 Constraint::Length(1),
             ])
+            .split(inner);
+
+        // Album art on the left, track info/gauge centered vertically
+        // beside it — `art::WIDTH + 2` gives it one column of breathing
+        // room on each side rather than butting straight up against the
+        // border and the info column.
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(art::WIDTH + 2), Constraint::Min(20)])
+            .split(sections[0]);
+
+        if let Some(protocol) = self.art_protocol.as_mut() {
+            let widget = StatefulImage::new(None).resize(Resize::Fit(None));
+            frame.render_stateful_widget(widget, cols[0], protocol);
+        } else {
+            let placeholder = Paragraph::new(art::placeholder()).alignment(Alignment::Center);
+            frame.render_widget(placeholder, cols[0]);
+        }
+
+        // `Fill` above and below the 2 info lines centers that compact block
+        // vertically within the taller art area beside it, rather than
+        // pinning it to the top with dead space below.
+        let info_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Fill(1), Constraint::Length(1), Constraint::Length(1), Constraint::Fill(1)])
             .split(cols[1]);
 
-        // Line 1: track — artist [format], accent-colored like rmpc's title.
+        // Track — artist [format], accent-colored like rmpc's title.
         let track = if now_playing.title.is_empty() { "(nothing loaded)" } else { &now_playing.title };
         let mut spans = vec![Span::styled(track, theme::accent())];
         if !now_playing.artist.is_empty() {
@@ -907,9 +933,9 @@ impl App<'_> {
         if !self.message.is_empty() {
             spans = vec![Span::raw(self.message.clone())];
         }
-        frame.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
+        frame.render_widget(Paragraph::new(Line::from(spans)), info_rows[1]);
 
-        // Line 2: a real progress gauge (position/duration).
+        // A real progress gauge (position/duration).
         let ratio = if now_playing.duration > 0.0 {
             (now_playing.position / now_playing.duration).clamp(0.0, 1.0)
         } else {
@@ -921,17 +947,17 @@ impl App<'_> {
             fmt_time(now_playing.position)
         };
         let gauge = Gauge::default().gauge_style(Style::default().fg(Color::Blue)).ratio(ratio).label(label);
-        frame.render_widget(gauge, rows[1]);
+        frame.render_widget(gauge, info_rows[2]);
 
-        // Lines 3..3+ROWS: a real spectrum visualizer — bar heights come
-        // from an actual FFT of the currently decoding audio (see
-        // daemon/src/visualizer.rs), not a simulated animation — rendered
-        // across multiple rows of sub-cell vertical resolution rather than
-        // flattened into one row.
-        frame.render_widget(Paragraph::new(spectrum_rows(&now_playing.spectrum)), rows[2]);
+        // A real spectrum visualizer — bar heights come from an actual FFT
+        // of the currently decoding audio (see daemon/src/visualizer.rs),
+        // not a simulated animation — spanning the panel's full width and
+        // rendered across multiple rows of sub-cell vertical resolution
+        // rather than flattened into one row.
+        frame.render_widget(Paragraph::new(spectrum_rows(&now_playing.spectrum, sections[1].width)), sections[1]);
 
-        // Line 4: [state] tag (rmpc's bracketed-yellow convention) + a
-        // compact inline volume slider + keybinding hints.
+        // [state] tag (rmpc's bracketed-yellow convention) + a compact
+        // inline volume slider + keybinding hints.
         let mut state_spans = vec![
             Span::styled("[", theme::state_tag()),
             Span::styled(now_playing.status.to_uppercase(), theme::state_tag()),
@@ -943,7 +969,7 @@ impl App<'_> {
         for span in &mut state_spans[4..] {
             span.style = theme::muted().patch(span.style);
         }
-        frame.render_widget(Paragraph::new(Line::from(state_spans)), rows[3]);
+        frame.render_widget(Paragraph::new(Line::from(state_spans)), sections[2]);
     }
 }
 
@@ -964,11 +990,13 @@ fn volume_slider(volume: f64) -> String {
 
 /// Renders spectrum bar levels across `spectrum::ROWS` terminal rows — real
 /// vertical resolution (each bar can fill part-way into a row via the
-/// `▁▂▃▄▅▆▇` sub-level glyphs, not just "on or off" per row) rather than the
-/// single flattened row this used to be squeezed into. Rows nearer the top
-/// (i.e. reached only by louder bars) are brighter, like a classic
-/// equalizer's hot/cool gradient recolored into this theme's blues.
-fn spectrum_rows(levels: &[u8]) -> Vec<Line<'static>> {
+/// `▁▂▃▄▅▆▇` sub-level glyphs, not just "on or off" per row) — stretched to
+/// fill the full `width` given rather than a fixed handful of columns, so
+/// the visualizer uses the whole viewport width and scales up as the
+/// terminal is resized wider. Rows nearer the top (i.e. reached only by
+/// louder bars) are brighter, like a classic equalizer's hot/cool gradient
+/// recolored into this theme's blues.
+fn spectrum_rows(levels: &[u8], width: u16) -> Vec<Line<'static>> {
     const SUB: [char; 8] = ['\u{0020}', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}'];
     let rows = spectrum::ROWS;
 
@@ -983,6 +1011,13 @@ fn spectrum_rows(levels: &[u8]) -> Vec<Line<'static>> {
             })
             .collect();
     }
+
+    // Each bar gets an equal slot of the available width, with the last
+    // column of a slot left blank as a gap between bars (skipped once
+    // slots get too narrow to spare it).
+    let slot = ((width as usize) / levels.len()).max(1);
+    let gap = usize::from(slot > 1);
+    let fill_width = slot - gap;
 
     (0..rows)
         .map(|r| {
@@ -1006,7 +1041,10 @@ fn spectrum_rows(levels: &[u8]) -> Vec<Line<'static>> {
                     } else {
                         ' '
                     };
-                    [Span::styled(ch.to_string(), Style::default().fg(color)), Span::raw(" ")]
+                    [
+                        Span::styled(ch.to_string().repeat(fill_width), Style::default().fg(color)),
+                        Span::raw(" ".repeat(gap)),
+                    ]
                 })
                 .collect();
             Line::from(spans)

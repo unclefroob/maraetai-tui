@@ -1,83 +1,73 @@
-//! Album art rendering for the now-playing panel: fetches cover art over
-//! HTTP, decodes it, and turns it into colored half-block terminal text —
-//! two vertical pixels per terminal row (the upper-half-block glyph's own
-//! color is the top pixel, the cell background is the bottom pixel). This
-//! needs no special terminal support (sixel/kitty graphics protocols,
-//! iTerm2's inline images) the way a "real" terminal image viewer would,
-//! at the cost of chunkier resolution — a reasonable trade for a TUI that
-//! has to keep working over SSH/tmux in whatever terminal the user has.
+//! Album art for the now-playing panel: fetches cover art over HTTP,
+//! decodes it, and hands it to `ratatui-image`, which renders it as a real
+//! image via whatever graphics protocol the terminal actually supports
+//! (Kitty, Sixel, iTerm2) — degrading to colored half-block characters when
+//! none of those are available, the same fallback ladder terminal image
+//! viewers like `chafa`/`viu` use.
 
 use image::DynamicImage;
-use image::imageops::FilterType;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
+use ratatui_image::picker::Picker;
 use tokio::sync::mpsc;
 
-/// Rendered art is always exactly `WIDTH` columns by `HEIGHT` rows, so
-/// swapping between "no art yet" (placeholder) and "art loaded" never
-/// shifts the now-playing panel's layout. `WIDTH == 2 * HEIGHT` because a
-/// terminal cell is roughly twice as tall as it is wide, and half-block
-/// rendering already halves that back down (2 pixel-rows per cell) — so
-/// this comes out close to square, matching a real album cover's aspect.
+/// Album art is rendered into a fixed-size column so the now-playing
+/// panel's layout never shifts between "no art" and "art loaded". `WIDTH ==
+/// 2 * HEIGHT` because a terminal cell is roughly twice as tall as it is
+/// wide, so this comes out close to square — matching a real album cover's
+/// aspect ratio. Only really governs the *placeholder*'s size and the panel
+/// layout math; a real graphics protocol resizes to fit this cell area
+/// using the terminal's actual font metrics, and half-block fallback fills
+/// it exactly by construction.
 pub const WIDTH: u16 = 20;
 pub const HEIGHT: u16 = 10;
 
-/// One fetch's result: the URL it was fetched for (so a reply that arrives
-/// after the user has already skipped to a different track — and this
-/// track's art is no longer wanted — can be discarded by the caller) and
-/// the rendered lines.
-pub struct Fetched {
-    pub url: String,
-    pub lines: Vec<Line<'static>>,
+/// Builds a `Picker` for the current terminal: real pixel-accurate font
+/// metrics and graphics-protocol detection when the terminal reports them
+/// (via a termios ioctl, then a bounded ~1s terminal query — see
+/// `ratatui-image::picker::Picker::guess_protocol`), degrading to a safe
+/// guess — which still renders correctly via the half-block fallback —
+/// when it can't.
+///
+/// Must be called after entering the alternate screen but before reading
+/// any terminal input events (`ratatui-image`'s own requirement — its
+/// protocol query briefly takes over raw stdin reads).
+pub fn make_picker() -> Picker {
+    let mut picker = Picker::from_termios().unwrap_or_else(|_| Picker::new((8, 16)));
+    picker.guess_protocol();
+    picker
 }
 
-/// Spawns a background fetch+decode+render of `url`, sending the result on
-/// `tx`. Never blocks the caller and never surfaces an error to it — a
-/// failed fetch or an undecodable image just means no `Fetched` ever
-/// arrives, so the placeholder keeps showing instead of a jarring toast for
-/// what's ultimately a cosmetic feature.
+/// One fetch's result: the URL it was fetched for (so a reply for a track
+/// the user has since skipped past can be discarded by the caller) and the
+/// decoded image, ready for `Picker::new_resize_protocol`.
+pub struct Fetched {
+    pub url: String,
+    pub image: DynamicImage,
+}
+
+/// Spawns a background fetch+decode of `url`, sending the result on `tx`.
+/// Never blocks the caller and never surfaces an error to it — a failed
+/// fetch or an undecodable image just means no `Fetched` ever arrives, so
+/// the placeholder keeps showing instead of a jarring toast for what's
+/// ultimately a cosmetic feature.
 pub fn spawn_fetch(url: String, tx: mpsc::UnboundedSender<Fetched>) {
     tokio::spawn(async move {
-        if let Some(lines) = fetch_and_render(&url).await {
-            let _ = tx.send(Fetched { url, lines });
+        if let Some(image) = fetch_and_decode(&url).await {
+            let _ = tx.send(Fetched { url, image });
         }
     });
 }
 
-async fn fetch_and_render(url: &str) -> Option<Vec<Line<'static>>> {
+async fn fetch_and_decode(url: &str) -> Option<DynamicImage> {
     let bytes = reqwest::get(url).await.ok()?.bytes().await.ok()?;
-    let img = image::load_from_memory(&bytes).ok()?;
-    Some(render(&img))
-}
-
-/// Renders `img` into exactly `WIDTH` x `HEIGHT` terminal cells.
-pub fn render(img: &DynamicImage) -> Vec<Line<'static>> {
-    let resized = img
-        .resize_exact(WIDTH as u32, HEIGHT as u32 * 2, FilterType::Triangle)
-        .to_rgb8();
-    (0..HEIGHT)
-        .map(|row| {
-            let spans: Vec<Span<'static>> = (0..WIDTH)
-                .map(|col| {
-                    let top = resized.get_pixel(col as u32, row as u32 * 2);
-                    let bottom = resized.get_pixel(col as u32, row as u32 * 2 + 1);
-                    Span::styled(
-                        "\u{2580}", // upper half block
-                        Style::default()
-                            .fg(Color::Rgb(top[0], top[1], top[2]))
-                            .bg(Color::Rgb(bottom[0], bottom[1], bottom[2])),
-                    )
-                })
-                .collect();
-            Line::from(spans)
-        })
-        .collect()
+    image::load_from_memory(&bytes).ok()
 }
 
 /// A same-size placeholder for when there's no art yet (no track loaded,
 /// still fetching, or the fetch/decode failed) — a plain dashed box with a
-/// centered note glyph, sized to exactly match `render()`'s output so the
-/// info column beside it never jumps sideways when real art does load in.
+/// centered note glyph, sized to match `WIDTH`x`HEIGHT` so the info column
+/// beside it never jumps sideways when real art loads in.
 pub fn placeholder() -> Vec<Line<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
     let inner_width = (WIDTH as usize).saturating_sub(2);
