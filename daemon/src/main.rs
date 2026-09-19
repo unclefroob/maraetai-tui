@@ -34,17 +34,19 @@ async fn main() -> Result<()> {
     let idle_timeout = Config::load().map(|c| c.idle_timeout()).unwrap_or_else(|_| {
         std::time::Duration::from_secs(maraetai_common::config::DEFAULT_IDLE_TIMEOUT_SECS)
     });
-    match Credentials::load() {
+    let credentials = match Credentials::load() {
         Ok(creds) => {
             tracing::info!(server = %creds.server_url, user = %creds.username, "credentials loaded");
+            Some(creds)
         }
         Err(e) => {
             tracing::warn!("not configured yet ({e}) — run `maraetai login`");
+            None
         }
-    }
+    };
 
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
-    let playback = playback::spawn(event_tx);
+    let playback = playback::spawn(event_tx, credentials);
     let shutdown = Arc::new(Notify::new());
 
     let mpris_server = Arc::new(

@@ -9,9 +9,9 @@ use zbus::Connection;
 use zbus::proxy;
 
 /// One queue entry: (stream_url, title, artist, album, art_url,
-/// duration_secs, format_label, lossless) — must match
+/// duration_secs, format_label, lossless, song_id) — must match
 /// `daemon::control::QueueEntry` exactly.
-pub type QueueEntry = (String, String, String, String, String, f64, String, bool);
+pub type QueueEntry = (String, String, String, String, String, f64, String, bool, String);
 
 #[proxy(
     interface = "com.maraetai.Daemon1",
@@ -32,7 +32,9 @@ pub trait Control {
     async fn seek_to(&self, position_secs: f64) -> zbus::Result<()>;
     async fn set_volume(&self, volume: f64) -> zbus::Result<()>;
     #[allow(clippy::type_complexity)]
-    async fn status(&self) -> zbus::Result<(String, String, String, String, f64, f64, u32, u32, f64, String, bool, String)>;
+    async fn status(
+        &self,
+    ) -> zbus::Result<(String, String, String, String, f64, f64, u32, u32, f64, String, bool, String, String)>;
     async fn quit(&self) -> zbus::Result<()>;
 }
 

@@ -19,11 +19,21 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use maraetai_common::Credentials;
+use maraetai_common::auth::AuthParams;
 use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink, Source};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::range_reader::RangeReader;
 use crate::visualizer::{self, SpectrumAnalyzer, VisualizerTap};
+
+/// A track "counts" as scrobbled once at least half its duration (capped at
+/// 4 minutes) has played — the classic Last.fm/AudioScrobbler threshold most
+/// Subsonic-compatible clients use, so a skip-after-a-few-seconds doesn't
+/// record a play but letting most of a track run does.
+fn scrobble_threshold(duration: Duration) -> Duration {
+    (duration / 2).min(Duration::from_secs(4 * 60))
+}
 
 /// How often the engine polls its own `Sink` for position/end-of-track while
 /// idle-waiting on the command channel. Small enough that MPRIS `Seeked`
@@ -47,6 +57,12 @@ pub enum Status {
 #[derive(Debug, Clone, Default)]
 pub struct TrackMeta {
     pub stream_url: String,
+    /// The Subsonic song id — needed to scrobble this track (maraetai-service
+    /// records a play by id, not by title/artist) and to look up lyrics by
+    /// id. Empty for a track played without library metadata (e.g. `maraetai
+    /// play <song-id>` with no other lookup) — scrobbling and id-based
+    /// lyrics are simply skipped for those.
+    pub song_id: String,
     pub title: String,
     pub artist: String,
     pub album: String,
@@ -220,8 +236,10 @@ impl PlaybackHandle {
 
 /// Spawns the engine thread and returns a handle to it. `events` is drained
 /// by an async task elsewhere (see `main.rs`) to emit MPRIS signals and feed
-/// the idle timer.
-pub fn spawn(events: UnboundedSender<Event>) -> PlaybackHandle {
+/// the idle timer. `credentials` is `None` when the daemon starts before
+/// `maraetai login` has ever been run — scrobbling is then silently skipped,
+/// same as everything else that needs credentials.
+pub fn spawn(events: UnboundedSender<Event>, credentials: Option<Credentials>) -> PlaybackHandle {
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
     let snapshot = Arc::new(Mutex::new(Snapshot::default()));
     let activity = Arc::new(AtomicBool::new(false));
@@ -234,7 +252,7 @@ pub fn spawn(events: UnboundedSender<Event>) -> PlaybackHandle {
 
     std::thread::Builder::new()
         .name("maraetai-audio".into())
-        .spawn(move || run_engine(cmd_rx, snapshot, events))
+        .spawn(move || run_engine(cmd_rx, snapshot, events, credentials))
         .expect("failed to spawn audio thread");
 
     handle
@@ -256,9 +274,23 @@ struct EngineState {
     /// the decoder at load time (needed for the FFT's frequency-bucket math,
     /// and no longer queryable once the decoder is consumed into the sink).
     current_format: Option<(u16, u32)>,
+    /// The track actually loaded into `sink`, if any — kept separate from
+    /// `queue[index]` because `PlayQueue` overwrites `queue` (and can reuse
+    /// the same `index`) *before* `start_playback_at` runs, which would
+    /// otherwise make "what was just playing" silently resolve to the *new*
+    /// queue's track instead of the one that's actually stopping. This is
+    /// scrobbling's only reason to exist — nothing else needs it.
+    current: Option<TrackMeta>,
+    /// `None` until `maraetai login` has been run.
+    credentials: Option<Credentials>,
 }
 
-fn run_engine(cmd_rx: Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>, events: UnboundedSender<Event>) {
+fn run_engine(
+    cmd_rx: Receiver<Command>,
+    snapshot: Arc<Mutex<Snapshot>>,
+    events: UnboundedSender<Event>,
+    credentials: Option<Credentials>,
+) {
     let stream = match OutputStreamBuilder::open_default_stream() {
         Ok(stream) => stream,
         Err(e) => {
@@ -277,6 +309,8 @@ fn run_engine(cmd_rx: Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>, events:
         analyzer,
         sample_ring,
         current_format: None,
+        current: None,
+        credentials,
     };
 
     loop {
@@ -302,8 +336,14 @@ fn run_engine(cmd_rx: Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>, events:
                 // than stopping.
             }
             Ok(Command::Previous) => {
-                let restart_current = current_position(&state) > RESTART_THRESHOLD || state.index == 0;
+                let position = current_position(&state);
+                let restart_current = position > RESTART_THRESHOLD || state.index == 0;
                 if restart_current {
+                    // Restarting counts as finishing this listen of the
+                    // track (a later restart-and-relisten is a separate,
+                    // independently-eligible play) — `state.current` stays
+                    // set to the same track, since we're not switching away.
+                    maybe_scrobble_outgoing(&state, position);
                     if let Some(sink) = &state.sink {
                         let _ = sink.try_seek(Duration::ZERO);
                         snapshot.lock().expect("poisoned").position = Duration::ZERO;
@@ -327,8 +367,10 @@ fn run_engine(cmd_rx: Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>, events:
             }
             Ok(Command::Stop) => {
                 if let Some(sink) = state.sink.take() {
+                    maybe_scrobble_outgoing(&state, sink.get_pos());
                     sink.stop();
                 }
+                state.current = None;
                 snapshot.lock().expect("poisoned").spectrum = [0; visualizer::BARS];
                 set_status(&snapshot, &events, Status::Stopped);
             }
@@ -376,10 +418,17 @@ fn start_playback_at(
     events: &UnboundedSender<Event>,
     index: usize,
 ) {
+    // Scrobble whatever was playing *before* touching `state.queue` — a
+    // `PlayQueue` command already overwrote it with the new list by the time
+    // this runs, so `state.current` (not `queue[index]`) is the only
+    // reliable record of what's actually stopping.
+    maybe_scrobble_outgoing(state, current_position(state));
+
     if let Some(sink) = state.sink.take() {
         sink.stop();
     }
     let Some(meta) = state.queue.get(index).cloned() else {
+        state.current = None;
         return;
     };
     state.index = index;
@@ -408,6 +457,7 @@ fn start_playback_at(
             tracing::error!("failed to decode stream: {e}");
             let _ = events.send(Event::PlaybackError(format!("could not play track: {e}")));
             set_status(snapshot, events, Status::Stopped);
+            state.current = None;
             return;
         }
     };
@@ -424,11 +474,13 @@ fn start_playback_at(
         let mut snap = snapshot.lock().expect("poisoned");
         snap.status = Status::Playing;
         snap.position = Duration::ZERO;
-        snap.track = Some(meta);
+        snap.track = Some(meta.clone());
         snap.queue_index = index;
         snap.queue_len = state.queue.len();
     }
     state.sink = Some(sink);
+    spawn_scrobble(state.http.clone(), state.credentials.clone(), meta.song_id.clone(), false);
+    state.current = Some(meta);
     let _ = events.send(Event::TrackChanged);
     let _ = events.send(Event::StatusChanged(Status::Playing));
 }
@@ -443,6 +495,12 @@ fn poll_progress(state: &mut EngineState, snapshot: &Arc<Mutex<Snapshot>>, event
             let next = state.index + 1;
             start_playback_at(state, snapshot, events, next);
         } else {
+            // The queue is truly exhausted — `start_playback_at` won't run
+            // to do this for us, so scrobble the just-finished track here.
+            // A track that reached natural end-of-stream is, almost by
+            // definition, past the scrobble threshold.
+            maybe_scrobble_outgoing(state, current_position(state));
+            state.current = None;
             let mut snap = snapshot.lock().expect("poisoned");
             snap.status = Status::Stopped;
             snap.spectrum = [0; visualizer::BARS];
@@ -472,4 +530,122 @@ fn poll_progress(state: &mut EngineState, snapshot: &Arc<Mutex<Snapshot>>, event
 fn set_status(snapshot: &Arc<Mutex<Snapshot>>, events: &UnboundedSender<Event>, status: Status) {
     snapshot.lock().expect("poisoned").status = status.clone();
     let _ = events.send(Event::StatusChanged(status));
+}
+
+/// Scrobbles `state.current` if it's been played past [`scrobble_threshold`]
+/// — call this right before a track stops being current (a track change, an
+/// explicit stop, or the queue running out), passing that track's position
+/// at the moment of the transition. A silent no-op when there's no current
+/// track, no credentials, no song id (a bare `maraetai play <id>` with no
+/// library duration to judge against), or the position doesn't clear the
+/// threshold — scrobbling is inherently best-effort background bookkeeping,
+/// never something playback should stall or error out over.
+fn maybe_scrobble_outgoing(state: &EngineState, position: Duration) {
+    let Some(track) = &state.current else { return };
+    if track.song_id.is_empty() {
+        return;
+    }
+    let Some(duration) = track.duration else { return };
+    if duration > Duration::ZERO && position >= scrobble_threshold(duration) {
+        spawn_scrobble(state.http.clone(), state.credentials.clone(), track.song_id.clone(), true);
+    }
+}
+
+/// Fires a Subsonic `scrobble` request on its own thread — matching
+/// `maraetai-service`'s own scrobble tee, which records the play
+/// asynchronously and does not want the caller to wait on it either.
+/// `submission=false` is the "now playing" notification (sent once per track
+/// start, purely informational — other Subsonic clients/the maraetai web
+/// app use it to show what's currently playing); `submission=true` is an
+/// actual recorded play. A missing `credentials` or empty `song_id` is a
+/// silent no-op — nothing to authenticate with, or nothing to identify the
+/// track by.
+fn spawn_scrobble(http: reqwest::blocking::Client, credentials: Option<Credentials>, song_id: String, submission: bool) {
+    let Some(creds) = credentials else { return };
+    if song_id.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        let auth = AuthParams::new(&creds.username, &creds.password);
+        let mut pairs: Vec<(String, String)> = vec![("id".into(), song_id), ("submission".into(), submission.to_string())];
+        auth.append_to(&mut pairs);
+        let url = format!("{}/rest/scrobble.view", creds.server_url.trim_end_matches('/'));
+        match http.get(&url).query(&pairs).send() {
+            Ok(resp) if !resp.status().is_success() => {
+                tracing::warn!(status = %resp.status(), submission, "scrobble request returned an error status");
+            }
+            Err(e) => tracing::warn!("scrobble request failed: {e}"),
+            Ok(_) => {}
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write as _;
+    use std::net::TcpListener;
+    use std::sync::mpsc as std_mpsc;
+
+    use super::*;
+
+    #[test]
+    fn scrobble_threshold_is_half_the_track_for_short_songs() {
+        assert_eq!(scrobble_threshold(Duration::from_secs(60)), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn scrobble_threshold_caps_at_four_minutes_for_long_songs() {
+        assert_eq!(scrobble_threshold(Duration::from_secs(60 * 20)), Duration::from_secs(4 * 60));
+    }
+
+    /// Verifies `spawn_scrobble` against `maraetai-service`'s actual
+    /// `scrobbleTee` contract (internal/proxy/scrobble.go in that repo): a
+    /// GET to `/rest/scrobble.view` carrying `id`, `submission`, and the
+    /// standard Subsonic auth params (`u`, `t`, `s`, `c`, `v`) as query
+    /// parameters — that handler reads `id`/`submission`/`u` straight off
+    /// `r.URL.Query()`, so the request line (not a body) is what matters.
+    #[test]
+    fn scrobble_request_matches_maraetai_services_scrobble_tee_contract() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std_mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = tx.send(request);
+        });
+
+        let creds = Credentials {
+            server_url: format!("http://{addr}"),
+            username: "alice".into(),
+            password: "hunter2".into(),
+        };
+        spawn_scrobble(reqwest::blocking::Client::new(), Some(creds), "song123".into(), true);
+
+        let request = rx.recv_timeout(Duration::from_secs(5)).expect("no scrobble request received in time");
+        let request_line = request.lines().next().unwrap_or_default();
+        assert!(
+            request_line.starts_with("GET /rest/scrobble.view?"),
+            "expected a GET to /rest/scrobble.view, got: {request_line}"
+        );
+        for expected_param in ["id=song123", "submission=true", "u=alice", "c=maraetai-tui"] {
+            assert!(request_line.contains(expected_param), "missing {expected_param} in: {request_line}");
+        }
+        // t (token) and s (salt) are present but their values are randomized
+        // per request — just confirm the keys exist.
+        assert!(request_line.contains("t="), "missing auth token param in: {request_line}");
+        assert!(request_line.contains("s="), "missing auth salt param in: {request_line}");
+    }
+
+    #[test]
+    fn scrobble_is_a_no_op_with_no_credentials() {
+        // Must not panic or spawn a request with nothing to authenticate
+        // with — there's no server to assert against here; the test's
+        // value is that this simply returns immediately rather than doing
+        // anything (e.g. panicking on an unwrap of `None`).
+        spawn_scrobble(reqwest::blocking::Client::new(), None, "song123".into(), true);
+    }
 }

@@ -89,6 +89,7 @@ async fn run_daemon_action(action: DaemonAction) -> Result<()> {
                     format_label,
                     _lossless,
                     _art_url,
+                    _song_id,
                 )) => {
                     if title.is_empty() {
                         println!("daemon running — {status}");
@@ -148,6 +149,7 @@ async fn run_play(
         0.0,
         String::new(), // format unknown — this command only has a raw song id, no library metadata
         false,
+        song_id.clone(),
     );
     proxy
         .play_queue(vec![track], 0)

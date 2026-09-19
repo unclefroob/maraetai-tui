@@ -58,9 +58,11 @@ enum Tab {
     Genres,
     Search,
     Queue,
+    Lyrics,
 }
 
-const TABS: [Tab; 6] = [Tab::Playlists, Tab::Albums, Tab::Artists, Tab::Genres, Tab::Search, Tab::Queue];
+const TABS: [Tab; 7] =
+    [Tab::Playlists, Tab::Albums, Tab::Artists, Tab::Genres, Tab::Search, Tab::Queue, Tab::Lyrics];
 
 impl Tab {
     fn label(self) -> &'static str {
@@ -71,6 +73,7 @@ impl Tab {
             Tab::Genres => "Genres",
             Tab::Search => "Search",
             Tab::Queue => "Queue",
+            Tab::Lyrics => "Lyrics",
         }
     }
 }
@@ -162,6 +165,18 @@ enum Screen {
         tracks: Vec<QueueRow>,
         selected: usize,
     },
+    /// Lyrics for whatever's currently playing. The actual lines (and the
+    /// fetch that produced them) live on `App` (`lyrics`,
+    /// `current_lyrics_song_id`) rather than here, keyed by song id and
+    /// refreshed automatically as the track changes — this variant only
+    /// carries the view's own scroll state. `follow`: auto-scroll to keep
+    /// the currently-sung line in view (for time-synced lyrics); becomes
+    /// `false` as soon as the user manually scrolls, and `true` again on
+    /// `Enter` or a track change.
+    Lyrics {
+        scroll: usize,
+        follow: bool,
+    },
 }
 
 /// A point-in-time playback status snapshot, as returned by `Status()`.
@@ -181,6 +196,9 @@ struct NowPlaying {
     /// separately in `App` (`art_lines`) since the art itself survives
     /// across `NowPlaying` snapshots rather than being refetched every poll.
     art_url: String,
+    /// Empty when there's no current track — the Subsonic song id, used to
+    /// fetch lyrics (and, server-side, to record scrobbles) for it.
+    song_id: String,
     /// Current spectrum bar levels (0..=`spectrum::MAX_LEVEL` each), polled
     /// alongside status. Empty (not all-zero — genuinely empty) while
     /// disconnected.
@@ -214,10 +232,31 @@ struct App<'a> {
     picker: Picker,
     art_tx: mpsc::UnboundedSender<art::Fetched>,
     art_rx: mpsc::UnboundedReceiver<art::Fetched>,
+    /// The song id lyrics are currently shown/being fetched for — `None` for
+    /// "nothing to show", directly comparable against `NowPlaying::song_id`
+    /// (empty string) via a small conversion at the call site, the same
+    /// pattern as `current_art_url`.
+    current_lyrics_song_id: Option<String>,
+    /// `None` while fetching or when there's nothing to show; `Some(vec![])`
+    /// specifically means "fetched successfully, this track really has no
+    /// lyrics" — distinct from "still loading", so the Lyrics tab can show
+    /// the right message for each.
+    lyrics: Option<Vec<library::LyricLine>>,
+    lyrics_tx: mpsc::UnboundedSender<LyricsFetched>,
+    lyrics_rx: mpsc::UnboundedReceiver<LyricsFetched>,
+}
+
+/// One lyrics fetch's result — see `art::Fetched` for why this carries the
+/// song id it was fetched for rather than assuming it's still current by
+/// the time it arrives.
+struct LyricsFetched {
+    song_id: String,
+    lines: Vec<library::LyricLine>,
 }
 
 pub async fn run(proxy: ControlProxy<'_>, creds: maraetai_common::Credentials) -> Result<()> {
     let (art_tx, art_rx) = mpsc::unbounded_channel();
+    let (lyrics_tx, lyrics_rx) = mpsc::unbounded_channel();
     let mut terminal = ratatui::init();
     let picker = art::make_picker();
     let mut app = App {
@@ -231,6 +270,10 @@ pub async fn run(proxy: ControlProxy<'_>, creds: maraetai_common::Credentials) -
         art_protocol: None,
         art_tx,
         art_rx,
+        current_lyrics_song_id: None,
+        lyrics: None,
+        lyrics_tx,
+        lyrics_rx,
     };
 
     app.switch_tab(Tab::Playlists, &mut terminal).await;
@@ -256,6 +299,7 @@ impl App<'_> {
             // besides the status poll below.
             let now_playing = self.fetch_status().await;
             self.update_art(&now_playing);
+            self.update_lyrics(&now_playing);
             terminal.draw(|frame| self.draw(frame, &now_playing))?;
 
             if !event::poll(POLL_INTERVAL)? {
@@ -347,6 +391,7 @@ impl App<'_> {
                 format_label,
                 lossless,
                 art_url,
+                song_id,
             )) => NowPlaying {
                 status,
                 title,
@@ -359,6 +404,7 @@ impl App<'_> {
                 format_label,
                 lossless,
                 art_url,
+                song_id,
                 spectrum,
             },
             Err(_) => NowPlaying {
@@ -373,6 +419,7 @@ impl App<'_> {
                 format_label: String::new(),
                 lossless: false,
                 art_url: String::new(),
+                song_id: String::new(),
                 spectrum: Vec::new(),
             },
         }
@@ -397,6 +444,39 @@ impl App<'_> {
             // past arriving late and clobbering the *current* track's art.
             if self.current_art_url.as_deref() == Some(fetched.url.as_str()) {
                 self.art_protocol = Some(self.picker.new_resize_protocol(fetched.image));
+            }
+        }
+    }
+
+    /// Same pattern as `update_art`, keyed by song id instead of art URL:
+    /// kicks off a background lyrics fetch when the current track changes,
+    /// and drains any completed fetch into `self.lyrics`. Also resets the
+    /// Lyrics screen's scroll/follow state, if it's the active screen, so a
+    /// new track always starts reading from the top rather than wherever
+    /// the previous track's lyrics happened to be scrolled to.
+    fn update_lyrics(&mut self, now_playing: &NowPlaying) {
+        let new_id = (!now_playing.song_id.is_empty()).then(|| now_playing.song_id.clone());
+        if new_id != self.current_lyrics_song_id {
+            self.current_lyrics_song_id = new_id.clone();
+            self.lyrics = None;
+            if let Some(id) = new_id {
+                let client = self.library.clone();
+                let tx = self.lyrics_tx.clone();
+                let artist = now_playing.artist.clone();
+                let title = now_playing.title.clone();
+                tokio::spawn(async move {
+                    let lines = client.lyrics(&id, &artist, &title).await;
+                    let _ = tx.send(LyricsFetched { song_id: id, lines });
+                });
+            }
+            if let Some(Screen::Lyrics { scroll, follow }) = self.stack.first_mut() {
+                *scroll = 0;
+                *follow = true;
+            }
+        }
+        while let Ok(fetched) = self.lyrics_rx.try_recv() {
+            if self.current_lyrics_song_id.as_deref() == Some(fetched.song_id.as_str()) {
+                self.lyrics = Some(fetched.lines);
             }
         }
     }
@@ -459,6 +539,13 @@ impl App<'_> {
                     }
                 }
             }
+            // No fetch here: lyrics are fetched by `update_lyrics` as soon
+            // as a track starts playing, independent of whether this tab
+            // has ever been visited, so by the time the user switches to it
+            // the fetch is usually already underway or done.
+            Tab::Lyrics => {
+                self.stack.push(Screen::Lyrics { scroll: 0, follow: true });
+            }
         }
     }
 
@@ -493,6 +580,14 @@ impl App<'_> {
 
     fn move_selection(&mut self, delta: i32) {
         let Some(screen) = self.stack.last_mut() else { return };
+        // Lyrics scrolls a line count, not a wrapping list selection — and
+        // manually scrolling disengages auto-follow, same as most lyrics
+        // views (Enter re-engages it, see `activate_selection`).
+        if let Screen::Lyrics { scroll, follow } = screen {
+            *follow = false;
+            *scroll = (*scroll as i32 + delta).max(0) as usize;
+            return;
+        }
         let (selected, len) = match screen {
             Screen::AlbumList { selected, albums, .. } => (selected, albums.len()),
             Screen::SongList { selected, songs, .. } => (selected, songs.len()),
@@ -502,6 +597,7 @@ impl App<'_> {
             Screen::Queue { selected, tracks } => (selected, tracks.len()),
             Screen::Search { selected, results, editing, .. } if !*editing => (selected, results.len()),
             Screen::Search { .. } => return,
+            Screen::Lyrics { .. } => unreachable!("handled above"),
         };
         if len == 0 {
             return;
@@ -510,6 +606,10 @@ impl App<'_> {
     }
 
     async fn activate_selection(&mut self, terminal: &mut ratatui::DefaultTerminal) {
+        if let Some(Screen::Lyrics { follow, .. }) = self.stack.last_mut() {
+            *follow = true;
+            return;
+        }
         match self.top() {
             Screen::AlbumList { albums, selected, .. } => {
                 if let Some(album) = albums.get(*selected).cloned() {
@@ -567,6 +667,8 @@ impl App<'_> {
                     }
                 }
             }
+            // Already handled (re-engage follow) by the early return above.
+            Screen::Lyrics { .. } => {}
         }
     }
 
@@ -660,6 +762,7 @@ impl App<'_> {
                     s.duration,
                     format_label,
                     lossless,
+                    s.id.clone(),
                 )
             })
             .collect();
@@ -764,6 +867,9 @@ impl App<'_> {
                     &now_playing.title,
                 );
             }
+            Screen::Lyrics { scroll, follow } => {
+                self.draw_lyrics(frame, chunks[1], *scroll, *follow, now_playing);
+            }
         }
 
         self.draw_status_bar(frame, chunks[2], now_playing);
@@ -865,6 +971,54 @@ impl App<'_> {
             .end_symbol(None)
             .thumb_style(theme::border());
         frame.render_stateful_widget(scrollbar, area.inner(Margin { vertical: 1, horizontal: 0 }), &mut state);
+    }
+
+    /// Renders whatever's in `self.lyrics` for the current track. Time-synced
+    /// lyrics highlight the line matching `now_playing.position` and, while
+    /// `follow` is on, keep it a third of the way down the visible area
+    /// (auto-scrolling as playback advances); unsynced lyrics are just a
+    /// static block the user scrolls manually. `follow` scroll is computed
+    /// fresh every frame from the live position rather than written back
+    /// into the screen's own `scroll` field, since it's meaningless the
+    /// moment the user takes over with a manual scroll anyway.
+    fn draw_lyrics(&self, frame: &mut Frame, area: Rect, scroll: usize, follow: bool, now_playing: &NowPlaying) {
+        let hint = if follow { "[Up/Down] scroll" } else { "[Up/Down] scroll  [Enter] follow" };
+        let block = rounded_block(format!(" Lyrics — {hint} "));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let Some(lines) = &self.lyrics else {
+            let msg = if self.current_lyrics_song_id.is_some() { "Loading lyrics…" } else { "(nothing playing)" };
+            frame.render_widget(Paragraph::new(Span::styled(msg, theme::muted())), inner);
+            return;
+        };
+        if lines.is_empty() {
+            frame.render_widget(Paragraph::new(Span::styled("No lyrics found for this track.", theme::muted())), inner);
+            return;
+        }
+
+        let position_ms = (now_playing.position * 1000.0).round() as i64;
+        let active_index = lines.iter().rposition(|l| l.start_ms.is_some_and(|start| start <= position_ms));
+
+        let effective_scroll = if follow {
+            match active_index {
+                Some(i) => i.saturating_sub((inner.height as usize) / 3),
+                None => 0,
+            }
+        } else {
+            scroll
+        };
+        let effective_scroll = effective_scroll.min(lines.len().saturating_sub(1)) as u16;
+
+        let rendered: Vec<Line> = lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let style = if Some(i) == active_index { theme::accent() } else { Style::default() };
+                Line::from(Span::styled(l.text.clone(), style))
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(rendered).scroll((effective_scroll, 0)), inner);
     }
 
     fn draw_status_bar(&mut self, frame: &mut Frame, area: Rect, now_playing: &NowPlaying) {

@@ -95,6 +95,96 @@ pub fn format_label(suffix: &str, bit_rate: Option<u32>) -> (String, bool) {
     (label, lossless)
 }
 
+/// One line of lyrics. `start_ms` is `Some` when the source was time-synced
+/// (either OpenSubsonic's structured `getLyricsBySongId`, or an LRC-format
+/// blob from the legacy `getLyrics`) — `None` for plain unsynced text, which
+/// is rendered as a single line with no highlight-as-you-play behavior.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LyricLine {
+    pub start_ms: Option<i64>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct StructuredLyrics {
+    #[serde(default)]
+    synced: bool,
+    #[serde(default)]
+    offset: Option<i64>,
+    #[serde(default)]
+    line: Vec<StructuredLyricLine>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct StructuredLyricLine {
+    #[serde(default)]
+    start: Option<i64>,
+    #[serde(default)]
+    value: String,
+}
+
+/// Parses simple LRC-format lyrics (`[mm:ss.xx]text`, possibly several
+/// stacked timestamps per line, plus an optional leading `[offset:±ms]`
+/// tag) — hand-rolled rather than pulling in a regex dependency for one
+/// small, fixed grammar. A line with no recognizable leading timestamp is
+/// skipped; if nothing in the blob parses as LRC at all, the caller falls
+/// back to treating the whole thing as one unsynced block.
+fn parse_lrc(text: &str) -> Vec<LyricLine> {
+    let mut offset_ms: i64 = 0;
+    let mut lines = Vec::new();
+
+    for raw in text.lines() {
+        let line = raw.trim().trim_start_matches('\u{feff}'); // strip a UTF-8 BOM, if present
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("[offset:").and_then(|s| s.strip_suffix(']')) {
+            if let Ok(ms) = rest.parse::<i64>() {
+                offset_ms = ms;
+            }
+            continue;
+        }
+
+        let mut rest = line;
+        let mut timestamps = Vec::new();
+        while let Some((ms, tail)) = parse_lrc_timestamp(rest) {
+            timestamps.push(ms);
+            rest = tail;
+        }
+        if timestamps.is_empty() {
+            continue;
+        }
+        let text = rest.trim().to_string();
+        for ms in timestamps {
+            lines.push(LyricLine { start_ms: Some(ms + offset_ms), text: text.clone() });
+        }
+    }
+
+    lines.sort_by_key(|l| l.start_ms.unwrap_or(i64::MAX));
+    lines
+}
+
+/// Parses one leading `[mm:ss.xx]`/`[mm:ss.xxx]` timestamp off the front of
+/// `s`, returning its value in milliseconds and the remainder of the
+/// string — or `None` if `s` doesn't start with one.
+fn parse_lrc_timestamp(s: &str) -> Option<(i64, &str)> {
+    let inner = s.strip_prefix('[')?;
+    let close = inner.find(']')?;
+    let (tag, tail) = (&inner[..close], &inner[close + 1..]);
+
+    let (mins_str, rest) = tag.split_once(':')?;
+    let (secs_str, frac_str) = rest.split_once('.')?;
+    let mins: i64 = mins_str.parse().ok()?;
+    let secs: i64 = secs_str.parse().ok()?;
+    if !(2..=3).contains(&frac_str.len()) || !frac_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let frac: i64 = frac_str.parse().ok()?;
+    let frac_ms = if frac_str.len() == 2 { frac * 10 } else { frac };
+    Some((mins * 60_000 + secs * 1_000 + frac_ms, tail))
+}
+
+#[derive(Clone)]
 pub struct Client {
     creds: Credentials,
     http: reqwest::Client,
@@ -197,6 +287,54 @@ impl Client {
         parse(root["albumList2"]["album"].take())
     }
 
+    /// Fetches lyrics for a track: OpenSubsonic's id-based, potentially
+    /// time-synced `getLyricsBySongId` first, falling back to the legacy
+    /// artist+title `getLyrics` (parsed as LRC if it looks synced, else
+    /// treated as one unsynced block) — the same pipeline every other
+    /// maraetai client already uses. Never errors: a server that doesn't
+    /// support the newer endpoint, has no lyrics at all, or is briefly
+    /// unreachable all just yield an empty list, since "no lyrics" and "the
+    /// request failed" look identical to the user either way.
+    pub async fn lyrics(&self, song_id: &str, artist: &str, title: &str) -> Vec<LyricLine> {
+        if let Ok(lines) = self.lyrics_by_song_id(song_id).await {
+            if !lines.is_empty() {
+                return lines;
+            }
+        }
+        self.lyrics_legacy(artist, title).await.unwrap_or_default()
+    }
+
+    async fn lyrics_by_song_id(&self, song_id: &str) -> Result<Vec<LyricLine>> {
+        let root = self.get_json("rest/getLyricsBySongId.view", &[("id", song_id)]).await?;
+        let structured: Vec<StructuredLyrics> = parse(root["lyricsList"]["structuredLyrics"].clone())?;
+        // Prefer a synced entry when more than one language/version comes back.
+        let Some(chosen) = structured.iter().find(|s| s.synced).or_else(|| structured.first()) else {
+            return Ok(Vec::new());
+        };
+        let offset = chosen.offset.unwrap_or(0);
+        let mut lines: Vec<LyricLine> = chosen
+            .line
+            .iter()
+            .map(|l| LyricLine { start_ms: l.start.map(|s| s + offset), text: l.value.clone() })
+            .collect();
+        lines.sort_by_key(|l| l.start_ms.unwrap_or(i64::MAX));
+        Ok(lines)
+    }
+
+    async fn lyrics_legacy(&self, artist: &str, title: &str) -> Result<Vec<LyricLine>> {
+        let root = self.get_json("rest/getLyrics.view", &[("artist", artist), ("title", title)]).await?;
+        let text = root["lyrics"]["value"].as_str().unwrap_or("").to_string();
+        if text.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let parsed = parse_lrc(&text);
+        if !parsed.is_empty() {
+            return Ok(parsed);
+        }
+        // Plain, unsynced text — one block, no timestamp.
+        Ok(vec![LyricLine { start_ms: None, text }])
+    }
+
     fn authed_url(&self, path: &str, extra: &[(&str, &str)]) -> String {
         let auth = AuthParams::new(&self.creds.username, &self.creds.password);
         let mut pairs: Vec<(String, String)> =
@@ -265,6 +403,29 @@ mod tests {
                 body
             );
             let _ = stream.write_all(response.as_bytes()).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// Like `respond_once`, but keeps serving the same JSON body to every
+    /// connection instead of exiting after the first — for tests exercising
+    /// a pipeline that makes more than one request (lyrics' structured-then-
+    /// legacy fallback).
+    async fn respond_always(body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { break };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
         });
         format!("http://{addr}")
     }
@@ -412,5 +573,94 @@ mod tests {
     fn format_label_is_case_insensitive_for_lossless_detection() {
         let (_, lossless) = format_label("FLAC", None);
         assert!(lossless);
+    }
+
+    #[test]
+    fn lrc_parses_single_timestamp_lines() {
+        let lines = parse_lrc("[00:12.50]Hello there\n[00:15.00]General Kenobi");
+        assert_eq!(
+            lines,
+            vec![
+                LyricLine { start_ms: Some(12_500), text: "Hello there".into() },
+                LyricLine { start_ms: Some(15_000), text: "General Kenobi".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn lrc_expands_multiple_stacked_timestamps_on_one_line() {
+        // A common LRC convention for a repeated chorus line.
+        let lines = parse_lrc("[00:10.00][00:40.00]La la la");
+        assert_eq!(
+            lines,
+            vec![
+                LyricLine { start_ms: Some(10_000), text: "La la la".into() },
+                LyricLine { start_ms: Some(40_000), text: "La la la".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn lrc_applies_the_offset_tag() {
+        let lines = parse_lrc("[offset:500]\n[00:10.00]Delayed line");
+        assert_eq!(lines, vec![LyricLine { start_ms: Some(10_500), text: "Delayed line".into() }]);
+    }
+
+    #[test]
+    fn lrc_three_digit_fraction_is_milliseconds_not_centiseconds() {
+        let lines = parse_lrc("[00:01.234]Fast line");
+        assert_eq!(lines[0].start_ms, Some(1_234));
+    }
+
+    #[test]
+    fn lrc_ignores_lines_with_no_timestamp() {
+        // A stray metadata line (e.g. "[ar:Some Artist]") some LRC files
+        // include — not a timestamp, so it must not produce a lyric line.
+        let lines = parse_lrc("[ar:Some Artist]\n[00:05.00]Real line");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "Real line");
+    }
+
+    #[test]
+    fn plain_text_with_no_lrc_timestamps_parses_as_empty() {
+        assert!(parse_lrc("Just some plain lyrics\nwith no timing at all").is_empty());
+    }
+
+    #[tokio::test]
+    async fn lyrics_prefers_structured_synced_over_legacy() {
+        let url = respond_once(
+            r#"{"subsonic-response":{"status":"ok","lyricsList":{"structuredLyrics":[
+                {"synced":true,"offset":100,"line":[{"start":1000,"value":"Synced line"}]}
+            ]}}}"#,
+        )
+        .await;
+
+        let client = Client::new(test_creds(url));
+        let lines = client.lyrics("s1", "Some Artist", "Some Title").await;
+        assert_eq!(lines, vec![LyricLine { start_ms: Some(1100), text: "Synced line".into() }]);
+    }
+
+    #[tokio::test]
+    async fn lyrics_falls_back_to_legacy_when_structured_is_empty() {
+        // getLyricsBySongId succeeds but returns nothing (e.g. an older
+        // Navidrome, or a song with no synced lyrics available) — the
+        // fallback endpoint must still be tried rather than giving up. The
+        // mocked body has no `lyricsList` at all, so the first (structured)
+        // request naturally parses as empty and the second (legacy) request
+        // is what actually supplies the line.
+        let url = respond_always(r#"{"subsonic-response":{"status":"ok","lyrics":{"value":"Plain unsynced lyrics"}}}"#).await;
+
+        let client = Client::new(test_creds(url));
+        let lines = client.lyrics("s1", "Some Artist", "Some Title").await;
+        assert_eq!(lines, vec![LyricLine { start_ms: None, text: "Plain unsynced lyrics".into() }]);
+    }
+
+    #[tokio::test]
+    async fn lyrics_is_empty_not_an_error_when_nothing_is_found() {
+        let url = respond_always(r#"{"subsonic-response":{"status":"failed","error":{"code":70,"message":"not found"}}}"#).await;
+
+        let client = Client::new(test_creds(url));
+        let lines = client.lyrics("s1", "Some Artist", "Some Title").await;
+        assert!(lines.is_empty());
     }
 }

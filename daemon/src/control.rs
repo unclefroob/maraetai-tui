@@ -14,11 +14,13 @@ use zbus::interface;
 use crate::playback::{PlaybackHandle, Status, TrackMeta};
 
 /// One queue entry as it crosses D-Bus: (stream_url, title, artist, album,
-/// art_url, duration_secs, format_label, lossless). A plain tuple rather
-/// than a named struct because zbus/zvariant encode it identically either
-/// way (`a(sssssdsb)`), and a tuple needs no extra type wiring on either
-/// side of the connection.
-pub type QueueEntry = (String, String, String, String, String, f64, String, bool);
+/// art_url, duration_secs, format_label, lossless, song_id). A plain tuple
+/// rather than a named struct because zbus/zvariant encode it identically
+/// either way, and a tuple needs no extra type wiring on either side of the
+/// connection. `song_id` (added for scrobbling/lyrics) trails at the end
+/// rather than being inserted among the original fields, so it's obvious at
+/// every call site which positional value is the new one.
+pub type QueueEntry = (String, String, String, String, String, f64, String, bool, String);
 
 pub struct ControlInterface {
     playback: PlaybackHandle,
@@ -37,9 +39,10 @@ impl ControlInterface {
 }
 
 fn to_track_meta(entry: QueueEntry) -> TrackMeta {
-    let (stream_url, title, artist, album, art_url, duration_secs, format_label, lossless) = entry;
+    let (stream_url, title, artist, album, art_url, duration_secs, format_label, lossless, song_id) = entry;
     TrackMeta {
         stream_url,
+        song_id,
         title,
         artist,
         album,
@@ -136,20 +139,21 @@ impl ControlInterface {
     /// now-playing bar: playback status, current track (title, artist,
     /// album), position/duration in seconds (duration 0 if unknown),
     /// (queue index, queue length), volume (0.0-1.0), format (format_label,
-    /// lossless), and cover art URL (empty if none). Kept as a plain method
-    /// (not properties) since it's a point-in-time snapshot read by a
-    /// one-shot CLI command or a polling loop, not something a D-Bus client
-    /// watches for changes — that's what MPRIS's properties (which do emit
-    /// `PropertiesChanged`) are for.
+    /// lossless), cover art URL (empty if none), and the Subsonic song id
+    /// (empty if none — used by the TUI to fetch lyrics for the current
+    /// track). Kept as a plain method (not properties) since it's a
+    /// point-in-time snapshot read by a one-shot CLI command or a polling
+    /// loop, not something a D-Bus client watches for changes — that's what
+    /// MPRIS's properties (which do emit `PropertiesChanged`) are for.
     #[allow(clippy::type_complexity)]
-    async fn status(&self) -> (String, String, String, String, f64, f64, u32, u32, f64, String, bool, String) {
+    async fn status(&self) -> (String, String, String, String, f64, f64, u32, u32, f64, String, bool, String, String) {
         let snap = self.playback.snapshot();
         let status = match snap.status {
             Status::Playing => "playing",
             Status::Paused => "paused",
             Status::Stopped => "stopped",
         };
-        let (title, artist, album, duration, format_label, lossless, art_url) = match snap.track {
+        let (title, artist, album, duration, format_label, lossless, art_url, song_id) = match snap.track {
             Some(t) => (
                 t.title,
                 t.artist,
@@ -158,8 +162,9 @@ impl ControlInterface {
                 t.format_label,
                 t.lossless,
                 t.art_url.unwrap_or_default(),
+                t.song_id,
             ),
-            None => (String::new(), String::new(), String::new(), 0.0, String::new(), false, String::new()),
+            None => (String::new(), String::new(), String::new(), 0.0, String::new(), false, String::new(), String::new()),
         };
         (
             status.to_string(),
@@ -174,6 +179,7 @@ impl ControlInterface {
             format_label,
             lossless,
             art_url,
+            song_id,
         )
     }
 
