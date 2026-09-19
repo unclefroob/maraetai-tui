@@ -675,10 +675,10 @@ impl App<'_> {
     }
 
     fn draw(&mut self, frame: &mut Frame, now_playing: &NowPlaying) {
-        // Now-playing panel: 2 border rows + `art::HEIGHT` (art + compact
-        // track info beside it) + `spectrum::ROWS` (full-width visualizer)
-        // + 1 (state line) — see `draw_status_bar`.
-        let now_playing_height = art::HEIGHT + spectrum::ROWS as u16 + 1 + 2;
+        // Now-playing panel: 2 border rows + `art::HEIGHT` (art, with
+        // title/gauge/spectrum filling the rest of that height beside it)
+        // + 1 (full-width state line) — see `draw_status_bar`.
+        let now_playing_height = art::HEIGHT + 1 + 2;
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(3), Constraint::Min(3), Constraint::Length(now_playing_height)])
@@ -875,22 +875,17 @@ impl App<'_> {
         let inner = rounded_block(" Now Playing ").inner(area);
         frame.render_widget(rounded_block(" Now Playing "), area);
 
-        // Top-to-bottom: [art + compact track info, side by side] then the
-        // spectrum and state line, both spanning the *entire* panel width
-        // rather than being squeezed into the space beside the art.
+        // Art-height section on top (art on the left, title/gauge/spectrum
+        // stacked in the rest of the space on the right), state line
+        // pinned full-width at the very bottom.
         let sections = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(art::HEIGHT),
-                Constraint::Length(spectrum::ROWS as u16),
-                Constraint::Length(1),
-            ])
+            .constraints([Constraint::Length(art::HEIGHT), Constraint::Length(1)])
             .split(inner);
 
-        // Album art on the left, track info/gauge centered vertically
-        // beside it — `art::WIDTH + 2` gives it one column of breathing
-        // room on each side rather than butting straight up against the
-        // border and the info column.
+        // `art::WIDTH + 2` gives the art one column of breathing room on
+        // each side rather than butting straight up against the border and
+        // the info column.
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(art::WIDTH + 2), Constraint::Min(20)])
@@ -904,12 +899,12 @@ impl App<'_> {
             frame.render_widget(placeholder, cols[0]);
         }
 
-        // `Fill` above and below the 2 info lines centers that compact block
-        // vertically within the taller art area beside it, rather than
-        // pinning it to the top with dead space below.
+        // Title and gauge get one row each; the spectrum then fills
+        // whatever's left of the column — the entire rest of the space to
+        // the right of the art, both width- and height-wise.
         let info_rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Fill(1), Constraint::Length(1), Constraint::Length(1), Constraint::Fill(1)])
+            .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)])
             .split(cols[1]);
 
         // Track — artist [format], accent-colored like rmpc's title.
@@ -933,7 +928,7 @@ impl App<'_> {
         if !self.message.is_empty() {
             spans = vec![Span::raw(self.message.clone())];
         }
-        frame.render_widget(Paragraph::new(Line::from(spans)), info_rows[1]);
+        frame.render_widget(Paragraph::new(Line::from(spans)), info_rows[0]);
 
         // A real progress gauge (position/duration).
         let ratio = if now_playing.duration > 0.0 {
@@ -947,17 +942,22 @@ impl App<'_> {
             fmt_time(now_playing.position)
         };
         let gauge = Gauge::default().gauge_style(Style::default().fg(Color::Blue)).ratio(ratio).label(label);
-        frame.render_widget(gauge, info_rows[2]);
+        frame.render_widget(gauge, info_rows[1]);
 
         // A real spectrum visualizer — bar heights come from an actual FFT
         // of the currently decoding audio (see daemon/src/visualizer.rs),
-        // not a simulated animation — spanning the panel's full width and
-        // rendered across multiple rows of sub-cell vertical resolution
-        // rather than flattened into one row.
-        frame.render_widget(Paragraph::new(spectrum_rows(&now_playing.spectrum, sections[1].width)), sections[1]);
+        // not a simulated animation — filling whatever space is left beside
+        // the art (both width and height), rendered across multiple rows of
+        // sub-cell vertical resolution rather than flattened into one row.
+        let spectrum_area = info_rows[2];
+        frame.render_widget(
+            Paragraph::new(spectrum_rows(&now_playing.spectrum, spectrum_area.width, spectrum_area.height)),
+            spectrum_area,
+        );
 
         // [state] tag (rmpc's bracketed-yellow convention) + a compact
-        // inline volume slider + keybinding hints.
+        // inline volume slider + keybinding hints — spans the full panel
+        // width, under both the art and the info column.
         let mut state_spans = vec![
             Span::styled("[", theme::state_tag()),
             Span::styled(now_playing.status.to_uppercase(), theme::state_tag()),
@@ -969,7 +969,7 @@ impl App<'_> {
         for span in &mut state_spans[4..] {
             span.style = theme::muted().patch(span.style);
         }
-        frame.render_widget(Paragraph::new(Line::from(state_spans)), sections[2]);
+        frame.render_widget(Paragraph::new(Line::from(state_spans)), sections[1]);
     }
 }
 
@@ -988,17 +988,20 @@ fn volume_slider(volume: f64) -> String {
     format!("{bar} {:>3}%", (volume * 100.0).round() as i32)
 }
 
-/// Renders spectrum bar levels across `spectrum::ROWS` terminal rows — real
+/// Renders spectrum bar levels across `height` terminal rows — real
 /// vertical resolution (each bar can fill part-way into a row via the
 /// `▁▂▃▄▅▆▇` sub-level glyphs, not just "on or off" per row) — stretched to
-/// fill the full `width` given rather than a fixed handful of columns, so
-/// the visualizer uses the whole viewport width and scales up as the
-/// terminal is resized wider. Rows nearer the top (i.e. reached only by
+/// fill the full `width` and `height` given rather than a fixed handful of
+/// rows/columns, so the visualizer fills whatever space it's given and
+/// scales up as the terminal is resized. Levels arrive quantized against
+/// `spectrum::MAX_LEVEL` (a fixed wire-format granularity, independent of
+/// any particular terminal's size) and are rescaled here to however many
+/// rows are actually available. Rows nearer the top (i.e. reached only by
 /// louder bars) are brighter, like a classic equalizer's hot/cool gradient
 /// recolored into this theme's blues.
-fn spectrum_rows(levels: &[u8], width: u16) -> Vec<Line<'static>> {
+fn spectrum_rows(levels: &[u8], width: u16, height: u16) -> Vec<Line<'static>> {
     const SUB: [char; 8] = ['\u{0020}', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}'];
-    let rows = spectrum::ROWS;
+    let rows = (height as usize).max(1);
 
     if levels.is_empty() {
         return (0..rows)
@@ -1032,8 +1035,14 @@ fn spectrum_rows(levels: &[u8], width: u16) -> Vec<Line<'static>> {
             let spans: Vec<Span<'static>> = levels
                 .iter()
                 .flat_map(|&level| {
-                    let full_rows = level as usize / 8;
-                    let remainder = level as usize % 8;
+                    // Rescale the fixed-granularity wire level to however
+                    // many eighths-of-a-row actually fit in `rows`, so a
+                    // maxed-out level always reaches the very top row
+                    // regardless of how tall this render happens to be.
+                    let normalized = level as f32 / spectrum::MAX_LEVEL as f32;
+                    let eighths = (normalized * (rows * 8) as f32).round() as usize;
+                    let full_rows = eighths / 8;
+                    let remainder = eighths % 8;
                     let ch = if row_from_bottom < full_rows {
                         '\u{2588}'
                     } else if row_from_bottom == full_rows {
