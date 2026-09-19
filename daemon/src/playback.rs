@@ -13,12 +13,13 @@
 //! something. A client-side-only queue would leave those buttons inert,
 //! which defeats a core point of building MPRIS support in the first place.
 
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
+use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink, Source};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::range_reader::RangeReader;
@@ -240,10 +241,11 @@ pub fn spawn(events: UnboundedSender<Event>) -> PlaybackHandle {
 }
 
 struct EngineState {
-    // `_stream` must stay alive for as long as `sink` plays anything — cpal
-    // tears down the output device when it's dropped.
-    _stream: OutputStream,
-    stream_handle: OutputStreamHandle,
+    // Must stay alive for as long as `sink` plays anything — cpal tears down
+    // the output device when it's dropped. Also the source of the `Mixer`
+    // each new `Sink` connects to (rodio 0.21 folded the old separate
+    // `OutputStreamHandle` into `OutputStream::mixer()`).
+    stream: OutputStream,
     sink: Option<Sink>,
     http: reqwest::blocking::Client,
     queue: Vec<TrackMeta>,
@@ -257,8 +259,8 @@ struct EngineState {
 }
 
 fn run_engine(cmd_rx: Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>, events: UnboundedSender<Event>) {
-    let (stream, stream_handle) = match OutputStream::try_default() {
-        Ok(pair) => pair,
+    let stream = match OutputStreamBuilder::open_default_stream() {
+        Ok(stream) => stream,
         Err(e) => {
             tracing::error!("no audio output device available: {e}");
             let _ = events.send(Event::PlaybackError(format!("no audio output device: {e}")));
@@ -267,8 +269,7 @@ fn run_engine(cmd_rx: Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>, events:
     };
     let (analyzer, sample_ring) = SpectrumAnalyzer::new();
     let mut state = EngineState {
-        _stream: stream,
-        stream_handle,
+        stream,
         sink: None,
         http: reqwest::blocking::Client::new(),
         queue: Vec::new(),
@@ -383,8 +384,25 @@ fn start_playback_at(
     };
     state.index = index;
 
-    let reader = RangeReader::new(state.http.clone(), meta.stream_url.clone());
-    let decoder = match Decoder::new(reader) {
+    let mut reader = RangeReader::new(state.http.clone(), meta.stream_url.clone());
+    // `RangeReader` only learns the resource's total length lazily, from the
+    // first response it gets — but `DecoderBuilder::with_byte_len` needs it
+    // supplied up front. Prime it with a throwaway 1-byte read, then seek
+    // back to the start before handing the reader to the decoder. Without a
+    // known byte length, Symphonia's FLAC seeking fails outright with
+    // `SeekError::Unseekable` (confirmed against a real FLAC file over a
+    // real HTTP Range server) — this priming step is what makes seeking
+    // actually work, not just look supported.
+    let mut probe = [0u8; 1];
+    let byte_len = reader.read_exact(&mut probe).ok().and_then(|()| {
+        let _ = reader.seek(SeekFrom::Start(0));
+        reader.known_len()
+    });
+    let mut decoder_builder = Decoder::builder().with_data(reader).with_seekable(true);
+    if let Some(len) = byte_len {
+        decoder_builder = decoder_builder.with_byte_len(len);
+    }
+    let decoder = match decoder_builder.build() {
         Ok(d) => d,
         Err(e) => {
             tracing::error!("failed to decode stream: {e}");
@@ -400,14 +418,7 @@ fn start_playback_at(
     state.analyzer.reset();
     let tapped = VisualizerTap::new(decoder, Arc::clone(&state.sample_ring));
 
-    let sink = match Sink::try_new(&state.stream_handle) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("failed to create audio sink: {e}");
-            let _ = events.send(Event::PlaybackError(format!("audio output error: {e}")));
-            return;
-        }
-    };
+    let sink = Sink::connect_new(state.stream.mixer());
     sink.append(tapped);
     {
         let mut snap = snapshot.lock().expect("poisoned");

@@ -884,11 +884,13 @@ impl App<'_> {
             .split(inner);
 
         // `art::WIDTH + 2` gives the art one column of breathing room on
-        // each side rather than butting straight up against the border and
-        // the info column.
+        // each side rather than butting straight up against the border;
+        // a separate gap column then keeps the info column from butting
+        // straight up against the art itself.
+        const GAP: u16 = 3;
         let cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(art::WIDTH + 2), Constraint::Min(20)])
+            .constraints([Constraint::Length(art::WIDTH + 2), Constraint::Length(GAP), Constraint::Min(20)])
             .split(sections[0]);
 
         if let Some(protocol) = self.art_protocol.as_mut() {
@@ -905,7 +907,7 @@ impl App<'_> {
         let info_rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)])
-            .split(cols[1]);
+            .split(cols[2]);
 
         // Track — artist [format], accent-colored like rmpc's title.
         let track = if now_playing.title.is_empty() { "(nothing loaded)" } else { &now_playing.title };

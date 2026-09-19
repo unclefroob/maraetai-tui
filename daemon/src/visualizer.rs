@@ -27,12 +27,15 @@ const FFT_SIZE: usize = 1024;
 
 const MIN_FREQ_HZ: f32 = 20.0;
 
-/// A fixed-capacity ring buffer of raw (interleaved, not yet downmixed) i16
-/// samples, shared between the audio-thread tap (writer) and the periodic
-/// analyzer (reader). Capacity is generous relative to `FFT_SIZE` so the
-/// analyzer always has a full window even right after a track/seek starts.
+/// A fixed-capacity ring buffer of raw (interleaved, not yet downmixed)
+/// samples — `f32` in rodio's own -1.0..1.0 convention (rodio 0.21+ decodes
+/// everything to `f32` regardless of source bit depth, no more manual
+/// normalization against `i16::MAX` needed) — shared between the
+/// audio-thread tap (writer) and the periodic analyzer (reader). Capacity is
+/// generous relative to `FFT_SIZE` so the analyzer always has a full window
+/// even right after a track/seek starts.
 pub struct SampleRing {
-    buf: Mutex<VecDeque<i16>>,
+    buf: Mutex<VecDeque<f32>>,
     capacity: usize,
 }
 
@@ -41,7 +44,7 @@ impl SampleRing {
         Arc::new(Self { buf: Mutex::new(VecDeque::with_capacity(capacity)), capacity })
     }
 
-    fn push(&self, sample: i16) {
+    fn push(&self, sample: f32) {
         let mut buf = self.buf.lock().expect("sample ring poisoned");
         if buf.len() >= self.capacity {
             buf.pop_front();
@@ -56,18 +59,19 @@ impl SampleRing {
     /// The most recent `n` raw (interleaved) samples, oldest first. Shorter
     /// than `n` (e.g. just after starting playback) is padded with zeros at
     /// the front, so callers always get a fixed-length slice.
-    fn latest(&self, n: usize) -> Vec<i16> {
+    fn latest(&self, n: usize) -> Vec<f32> {
         let buf = self.buf.lock().expect("sample ring poisoned");
         let have = buf.len().min(n);
-        let mut out = vec![0i16; n - have];
+        let mut out = vec![0.0f32; n - have];
         out.extend(buf.iter().rev().take(have).rev());
         out
     }
 }
 
-/// Wraps a `Source<Item = i16>` (what `rodio::Decoder` produces regardless of
-/// input codec), forwarding every sample to the `Sink` unchanged while also
-/// pushing a copy into the shared ring buffer for the visualizer to read.
+/// Wraps a `Source<Item = f32>` (what `rodio::Decoder` produces regardless of
+/// input codec, since rodio 0.21), forwarding every sample to the `Sink`
+/// unchanged while also pushing a copy into the shared ring buffer for the
+/// visualizer to read.
 pub struct VisualizerTap<S> {
     inner: S,
     ring: Arc<SampleRing>,
@@ -79,9 +83,9 @@ impl<S> VisualizerTap<S> {
     }
 }
 
-impl<S: Iterator<Item = i16>> Iterator for VisualizerTap<S> {
-    type Item = i16;
-    fn next(&mut self) -> Option<i16> {
+impl<S: Iterator<Item = f32>> Iterator for VisualizerTap<S> {
+    type Item = f32;
+    fn next(&mut self) -> Option<f32> {
         let sample = self.inner.next()?;
         self.ring.push(sample);
         Some(sample)
@@ -91,9 +95,9 @@ impl<S: Iterator<Item = i16>> Iterator for VisualizerTap<S> {
     }
 }
 
-impl<S: Source<Item = i16>> Source for VisualizerTap<S> {
-    fn current_frame_len(&self) -> Option<usize> {
-        self.inner.current_frame_len()
+impl<S: Source<Item = f32>> Source for VisualizerTap<S> {
+    fn current_span_len(&self) -> Option<usize> {
+        self.inner.current_span_len()
     }
     fn channels(&self) -> u16 {
         self.inner.channels()
@@ -156,10 +160,12 @@ impl SpectrumAnalyzer {
         let channels = channels.max(1) as usize;
         let raw = self.ring.latest(FFT_SIZE * channels);
 
-        // Downmix interleaved channels to mono, normalized to -1.0..1.0.
+        // Downmix interleaved channels to mono — samples already arrive
+        // normalized to -1.0..1.0 (rodio's own `f32` sample convention), no
+        // manual scaling needed.
         let mono: Vec<f32> = raw
             .chunks(channels)
-            .map(|frame| frame.iter().map(|&s| s as f32 / i16::MAX as f32).sum::<f32>() / channels as f32)
+            .map(|frame| frame.iter().sum::<f32>() / channels as f32)
             .collect();
 
         let mut buffer: Vec<Complex<f32>> = mono
@@ -212,26 +218,26 @@ mod tests {
     #[test]
     fn ring_pads_with_zeros_when_not_enough_samples_yet() {
         let ring = SampleRing::new(100);
-        ring.push(1);
-        ring.push(2);
+        ring.push(1.0);
+        ring.push(2.0);
         let latest = ring.latest(5);
-        assert_eq!(latest, vec![0, 0, 0, 1, 2]);
+        assert_eq!(latest, vec![0.0, 0.0, 0.0, 1.0, 2.0]);
     }
 
     #[test]
     fn ring_drops_oldest_beyond_capacity() {
         let ring = SampleRing::new(3);
-        for s in [1, 2, 3, 4, 5] {
+        for s in [1.0, 2.0, 3.0, 4.0, 5.0] {
             ring.push(s);
         }
-        assert_eq!(ring.latest(3), vec![3, 4, 5]);
+        assert_eq!(ring.latest(3), vec![3.0, 4.0, 5.0]);
     }
 
     #[test]
     fn silence_produces_all_zero_bars() {
         let (mut analyzer, ring) = SpectrumAnalyzer::new();
         for _ in 0..(FFT_SIZE * 2) {
-            ring.push(0);
+            ring.push(0.0);
         }
         let bars = analyzer.compute(2, 44100);
         assert_eq!(bars, [0u8; BARS], "silence must not produce non-zero bars");
@@ -245,7 +251,7 @@ mod tests {
         for n in 0..(FFT_SIZE * 2) {
             let t = (n / 2) as f32 / sample_rate; // stereo: same value both channels
             let v = (2.0 * std::f32::consts::PI * tone_hz * t).sin();
-            ring.push((v * i16::MAX as f32 * 0.8) as i16);
+            ring.push(v * 0.8);
         }
         let bars = analyzer.compute(2, 44100);
         let loudest = bars.iter().enumerate().max_by_key(|(_, &v)| v).unwrap().0;
