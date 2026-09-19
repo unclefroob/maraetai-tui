@@ -198,10 +198,17 @@ impl ControlInterface {
     /// point-in-time snapshot read by a one-shot CLI command or a polling
     /// loop, not something a D-Bus client watches for changes — that's what
     /// MPRIS's properties (which do emit `PropertiesChanged`) are for.
+    ///
+    /// Every connected TUI polls this every ~250ms for as long as it's
+    /// open, so it doubles as the daemon's "someone is using this" signal
+    /// for the idle timer (see `mark_client_activity`) — otherwise an open
+    /// TUI sitting on a paused/stopped track looks identical to no client
+    /// at all, and gets shut down out from under it.
     #[allow(clippy::type_complexity)]
     async fn status(
         &self,
     ) -> (String, String, String, String, f64, f64, u32, u32, f64, String, bool, String, String, String, bool) {
+        self.playback.mark_client_activity();
         let snap = self.playback.snapshot();
         let status = match snap.status {
             Status::Playing => "playing",
