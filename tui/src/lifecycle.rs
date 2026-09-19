@@ -2,7 +2,9 @@
 //! and wait for it to come up. This is what makes "just run `maraetai`" work
 //! without a separate manual `maraetaid &` step.
 
+use std::fs::OpenOptions;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -30,6 +32,9 @@ pub async fn ensure_daemon_running() -> Result<Connection> {
     tracing::info!("no daemon running — spawning maraetaid");
     let exe = daemon_binary_path()?;
     std::process::Command::new(&exe)
+        .stdin(Stdio::null())
+        .stdout(daemon_log_stdio())
+        .stderr(daemon_log_stdio())
         .spawn()
         .with_context(|| format!("failed to spawn {}", exe.display()))?;
 
@@ -46,6 +51,26 @@ pub async fn ensure_daemon_running() -> Result<Connection> {
         SPAWN_WAIT_TIMEOUT,
         exe.display()
     );
+}
+
+/// A fresh handle onto the daemon's log file, in append mode — never the
+/// TUI's own stdout/stderr. Without this, the auto-spawned daemon inherits
+/// the TUI's terminal directly, and raw libasound diagnostics (e.g. a PCM
+/// underrun) bypass our own logging entirely and get written straight into
+/// the alternate screen, corrupting the display. Falls back to discarding
+/// output entirely if the log file can't be opened, rather than falling
+/// back to inheriting the terminal (which is the exact problem being
+/// avoided here).
+fn daemon_log_stdio() -> Stdio {
+    let log_path = maraetai_common::paths::runtime_dir().join("daemon.log");
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_or_else(|_| Stdio::null(), Stdio::from)
 }
 
 async fn daemon_is_alive(connection: &Connection) -> bool {
