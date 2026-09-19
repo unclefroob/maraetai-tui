@@ -894,14 +894,14 @@ impl App<'_> {
             .split(sections[0]);
 
         if let Some(protocol) = self.art_protocol.as_mut() {
-            // `Crop`, not `Fit`: a cover whose aspect ratio doesn't exactly
-            // match this cell box would otherwise get letterboxed, ending
-            // short of the box's full height — which visually reads as "the
-            // spectrum beside it (which does fill its full height) runs
-            // past the bottom of the art". Cropping guarantees the art
-            // always fills the box exactly, so the two stay visually
-            // aligned regardless of the actual image's aspect ratio.
-            let widget = StatefulImage::new(None).resize(Resize::Crop(None));
+            // `Fit`, not `Crop`: ratatui-image's `Crop` clips raw pixels out
+            // of the *original* image at the box's target pixel size with no
+            // scaling step, which on a real (large) cover zooms into an
+            // unrecognizable corner rather than showing a shrunk crop. The
+            // art is already pre-cropped to a square in `art.rs`
+            // (`center_crop_to_square`), so `Fit`'s aspect-preserving scale
+            // now fills this near-square box with little to no letterboxing.
+            let widget = StatefulImage::new(None).resize(Resize::Fit(None));
             frame.render_stateful_widget(widget, cols[0], protocol);
         } else {
             let placeholder = Paragraph::new(art::placeholder()).alignment(Alignment::Center);

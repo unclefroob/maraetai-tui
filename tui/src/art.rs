@@ -61,7 +61,24 @@ pub fn spawn_fetch(url: String, tx: mpsc::UnboundedSender<Fetched>) {
 
 async fn fetch_and_decode(url: &str) -> Option<DynamicImage> {
     let bytes = reqwest::get(url).await.ok()?.bytes().await.ok()?;
-    image::load_from_memory(&bytes).ok()
+    Some(center_crop_to_square(image::load_from_memory(&bytes).ok()?))
+}
+
+/// Crops the longer dimension down to match the shorter one, centered —
+/// album art is almost always already square, but when it isn't this avoids
+/// a surprising letterbox. Doing this crop *before* handing the image to
+/// `ratatui-image` matters: its own `Resize::Crop` clips straight pixels out
+/// of the original at the target's raw pixel size with no scaling step
+/// first, so on a real (large) cover it zooms into an unrecognizable corner
+/// rather than showing a scaled-down crop. Pre-cropping to the right aspect
+/// ourselves and then asking it to `Fit` (scale, not clip) is what actually
+/// produces a normal-looking thumbnail.
+fn center_crop_to_square(img: DynamicImage) -> DynamicImage {
+    let (w, h) = (img.width(), img.height());
+    let side = w.min(h);
+    let x = (w - side) / 2;
+    let y = (h - side) / 2;
+    img.crop_imm(x, y, side, side)
 }
 
 /// A same-size placeholder for when there's no art yet (no track loaded,
@@ -87,4 +104,30 @@ pub fn placeholder() -> Vec<Line<'static>> {
             Line::from(Span::styled(text, dim))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crops_a_wide_image_to_a_centered_square() {
+        let img = DynamicImage::new_rgb8(100, 60);
+        let cropped = center_crop_to_square(img);
+        assert_eq!((cropped.width(), cropped.height()), (60, 60));
+    }
+
+    #[test]
+    fn crops_a_tall_image_to_a_centered_square() {
+        let img = DynamicImage::new_rgb8(60, 100);
+        let cropped = center_crop_to_square(img);
+        assert_eq!((cropped.width(), cropped.height()), (60, 60));
+    }
+
+    #[test]
+    fn leaves_an_already_square_image_unchanged() {
+        let img = DynamicImage::new_rgb8(80, 80);
+        let cropped = center_crop_to_square(img);
+        assert_eq!((cropped.width(), cropped.height()), (80, 80));
+    }
 }
