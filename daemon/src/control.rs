@@ -135,21 +135,21 @@ impl ControlInterface {
     /// A compact status summary for `maraetai daemon status` and the TUI's
     /// now-playing bar: playback status, current track (title, artist,
     /// album), position/duration in seconds (duration 0 if unknown),
-    /// (queue index, queue length), volume (0.0-1.0), and format
-    /// (format_label, lossless). Kept as a plain method (not properties)
-    /// since it's a point-in-time snapshot read by a one-shot CLI command or
-    /// a polling loop, not something a D-Bus client watches for changes —
-    /// that's what MPRIS's properties (which do emit `PropertiesChanged`)
-    /// are for.
+    /// (queue index, queue length), volume (0.0-1.0), format (format_label,
+    /// lossless), and cover art URL (empty if none). Kept as a plain method
+    /// (not properties) since it's a point-in-time snapshot read by a
+    /// one-shot CLI command or a polling loop, not something a D-Bus client
+    /// watches for changes — that's what MPRIS's properties (which do emit
+    /// `PropertiesChanged`) are for.
     #[allow(clippy::type_complexity)]
-    async fn status(&self) -> (String, String, String, String, f64, f64, u32, u32, f64, String, bool) {
+    async fn status(&self) -> (String, String, String, String, f64, f64, u32, u32, f64, String, bool, String) {
         let snap = self.playback.snapshot();
         let status = match snap.status {
             Status::Playing => "playing",
             Status::Paused => "paused",
             Status::Stopped => "stopped",
         };
-        let (title, artist, album, duration, format_label, lossless) = match snap.track {
+        let (title, artist, album, duration, format_label, lossless, art_url) = match snap.track {
             Some(t) => (
                 t.title,
                 t.artist,
@@ -157,8 +157,9 @@ impl ControlInterface {
                 t.duration.map(|d| d.as_secs_f64()).unwrap_or(0.0),
                 t.format_label,
                 t.lossless,
+                t.art_url.unwrap_or_default(),
             ),
-            None => (String::new(), String::new(), String::new(), 0.0, String::new(), false),
+            None => (String::new(), String::new(), String::new(), 0.0, String::new(), false, String::new()),
         };
         (
             status.to_string(),
@@ -172,6 +173,7 @@ impl ControlInterface {
             snap.volume as f64,
             format_label,
             lossless,
+            art_url,
         )
     }
 

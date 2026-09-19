@@ -8,6 +8,7 @@ pub mod config;
 pub mod dbus;
 pub mod error;
 pub mod paths;
+pub mod spectrum;
 
 pub use config::{Config, Credentials};
 pub use error::{Error, Result};

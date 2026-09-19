@@ -1,4 +1,5 @@
 mod app;
+mod art;
 mod dbus_client;
 mod library;
 mod lifecycle;
@@ -87,6 +88,7 @@ async fn run_daemon_action(action: DaemonAction) -> Result<()> {
                     _volume,
                     format_label,
                     _lossless,
+                    _art_url,
                 )) => {
                     if title.is_empty() {
                         println!("daemon running — {status}");

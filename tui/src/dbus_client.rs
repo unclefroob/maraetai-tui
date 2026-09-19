@@ -32,7 +32,7 @@ pub trait Control {
     async fn seek_to(&self, position_secs: f64) -> zbus::Result<()>;
     async fn set_volume(&self, volume: f64) -> zbus::Result<()>;
     #[allow(clippy::type_complexity)]
-    async fn status(&self) -> zbus::Result<(String, String, String, String, f64, f64, u32, u32, f64, String, bool)>;
+    async fn status(&self) -> zbus::Result<(String, String, String, String, f64, f64, u32, u32, f64, String, bool, String)>;
     async fn quit(&self) -> zbus::Result<()>;
 }
 

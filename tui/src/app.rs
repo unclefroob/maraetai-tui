@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use maraetai_common::spectrum;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Style};
@@ -31,7 +32,9 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Gauge, List, ListItem, ListState, Paragraph, Row, Scrollbar,
     ScrollbarOrientation, ScrollbarState, Table, TableState,
 };
+use tokio::sync::mpsc;
 
+use crate::art;
 use crate::dbus_client::{ControlProxy, QueueEntry};
 use crate::library::{self, Album, Artist, Genre, Playlist, Song};
 
@@ -169,8 +172,14 @@ struct NowPlaying {
     volume: f64,
     format_label: String,
     lossless: bool,
-    /// Current spectrum bar levels (0..=7 each), polled alongside status.
-    /// Empty (not all-zero — genuinely empty) while disconnected.
+    /// Empty when there's no current track or it has no cover art — distinct
+    /// from a fetch simply not having completed yet, which is tracked
+    /// separately in `App` (`art_lines`) since the art itself survives
+    /// across `NowPlaying` snapshots rather than being refetched every poll.
+    art_url: String,
+    /// Current spectrum bar levels (0..=`spectrum::MAX_LEVEL` each), polled
+    /// alongside status. Empty (not all-zero — genuinely empty) while
+    /// disconnected.
     spectrum: Vec<u8>,
 }
 
@@ -185,15 +194,31 @@ struct App<'a> {
     /// "Loading…" during a fetch, or a fetch failure. Cleared on the next
     /// successful action.
     message: String,
+    /// The art URL currently being shown/fetched — `None` for "no art" so
+    /// this is directly comparable to `NowPlaying::art_url` (empty string)
+    /// via a small conversion at the call site, avoiding refetching the same
+    /// track's art every 250ms poll tick.
+    current_art_url: Option<String>,
+    /// Rendered art for `current_art_url`, once its background fetch
+    /// completes. `None` shows `art::placeholder()` instead — while
+    /// fetching, or when there's simply no art to show.
+    art_lines: Option<Vec<Line<'static>>>,
+    art_tx: mpsc::UnboundedSender<art::Fetched>,
+    art_rx: mpsc::UnboundedReceiver<art::Fetched>,
 }
 
 pub async fn run(proxy: ControlProxy<'_>, creds: maraetai_common::Credentials) -> Result<()> {
+    let (art_tx, art_rx) = mpsc::unbounded_channel();
     let mut app = App {
         proxy,
         library: library::Client::new(creds),
         active_tab: Tab::Albums,
         stack: Vec::new(),
         message: String::new(),
+        current_art_url: None,
+        art_lines: None,
+        art_tx,
+        art_rx,
     };
 
     let mut terminal = ratatui::init();
@@ -219,6 +244,7 @@ impl App<'_> {
             // this binary has no other async work contending for the thread
             // besides the status poll below.
             let now_playing = self.fetch_status().await;
+            self.update_art(&now_playing);
             terminal.draw(|frame| self.draw(frame, &now_playing))?;
 
             if !event::poll(POLL_INTERVAL)? {
@@ -309,6 +335,7 @@ impl App<'_> {
                 volume,
                 format_label,
                 lossless,
+                art_url,
             )) => NowPlaying {
                 status,
                 title,
@@ -320,6 +347,7 @@ impl App<'_> {
                 volume,
                 format_label,
                 lossless,
+                art_url,
                 spectrum,
             },
             Err(_) => NowPlaying {
@@ -333,8 +361,32 @@ impl App<'_> {
                 volume: 1.0,
                 format_label: String::new(),
                 lossless: false,
+                art_url: String::new(),
                 spectrum: Vec::new(),
             },
+        }
+    }
+
+    /// Kicks off a background art fetch when the current track's art has
+    /// changed since the last poll, and drains any completed fetch(es) from
+    /// earlier ticks into `self.art_lines`. Cheap to call every tick: both
+    /// the URL comparison and the channel drain are no-ops in the (by far
+    /// most common) case where nothing has changed.
+    fn update_art(&mut self, now_playing: &NowPlaying) {
+        let new_url = (!now_playing.art_url.is_empty()).then(|| now_playing.art_url.clone());
+        if new_url != self.current_art_url {
+            self.current_art_url = new_url.clone();
+            self.art_lines = None;
+            if let Some(url) = new_url {
+                art::spawn_fetch(url, self.art_tx.clone());
+            }
+        }
+        while let Ok(fetched) = self.art_rx.try_recv() {
+            // Guards against a fetch for a track the user has since skipped
+            // past arriving late and clobbering the *current* track's art.
+            if self.current_art_url.as_deref() == Some(fetched.url.as_str()) {
+                self.art_lines = Some(fetched.lines);
+            }
         }
     }
 
@@ -612,9 +664,14 @@ impl App<'_> {
     }
 
     fn draw(&self, frame: &mut Frame, now_playing: &NowPlaying) {
+        // Now-playing panel: 2 border rows + `art::HEIGHT` content rows —
+        // title/gauge/spectrum/state on the right are laid out to add up to
+        // exactly that same height (see `draw_status_bar`), so the panel is
+        // exactly as tall as the album art needs and no taller.
+        let now_playing_height = art::HEIGHT + 2;
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(3), Constraint::Length(6)])
+            .constraints([Constraint::Length(3), Constraint::Min(3), Constraint::Length(now_playing_height)])
             .split(frame.area());
 
         self.draw_tab_bar(frame, chunks[0]);
@@ -803,13 +860,31 @@ impl App<'_> {
     fn draw_status_bar(&self, frame: &mut Frame, area: Rect, now_playing: &NowPlaying) {
         // `Block::inner` already accounts for the border on all four sides —
         // an additional `.margin(1)` on the Layout on top of that would
-        // leave too little space for the 4 requested rows (found the hard
-        // way once already). No extra margin needed here.
+        // leave too little space for the requested rows (found the hard way
+        // once already). No extra margin needed here.
+        let inner = rounded_block(" Now Playing ").inner(area);
+        frame.render_widget(rounded_block(" Now Playing "), area);
+
+        // Album art on the left, track info/gauge/spectrum/state on the
+        // right — `art::WIDTH + 2` gives it one column of breathing room on
+        // each side rather than butting straight up against the border and
+        // the info column.
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(art::WIDTH + 2), Constraint::Min(20)])
+            .split(inner);
+        let art_lines = self.art_lines.clone().unwrap_or_else(art::placeholder);
+        frame.render_widget(Paragraph::new(art_lines).alignment(Alignment::Center), cols[0]);
+
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)])
-            .split(rounded_block(" Now Playing ").inner(area));
-        frame.render_widget(rounded_block(" Now Playing "), area);
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(spectrum::ROWS as u16),
+                Constraint::Length(1),
+            ])
+            .split(cols[1]);
 
         // Line 1: track — artist [format], accent-colored like rmpc's title.
         let track = if now_playing.title.is_empty() { "(nothing loaded)" } else { &now_playing.title };
@@ -848,10 +923,12 @@ impl App<'_> {
         let gauge = Gauge::default().gauge_style(Style::default().fg(Color::Blue)).ratio(ratio).label(label);
         frame.render_widget(gauge, rows[1]);
 
-        // Line 3: a real spectrum visualizer — bar heights come from an
-        // actual FFT of the currently decoding audio (see
-        // daemon/src/visualizer.rs), not a simulated animation.
-        frame.render_widget(Paragraph::new(spectrum_line(&now_playing.spectrum)), rows[2]);
+        // Lines 3..3+ROWS: a real spectrum visualizer — bar heights come
+        // from an actual FFT of the currently decoding audio (see
+        // daemon/src/visualizer.rs), not a simulated animation — rendered
+        // across multiple rows of sub-cell vertical resolution rather than
+        // flattened into one row.
+        frame.render_widget(Paragraph::new(spectrum_rows(&now_playing.spectrum)), rows[2]);
 
         // Line 4: [state] tag (rmpc's bracketed-yellow convention) + a
         // compact inline volume slider + keybinding hints.
@@ -885,32 +962,54 @@ fn volume_slider(volume: f64) -> String {
     format!("{bar} {:>3}%", (volume * 100.0).round() as i32)
 }
 
-/// Renders spectrum bar levels as a single line of block characters (one per
-/// bar, so an N-bar spectrum fits in exactly one terminal row regardless of
-/// N) — `▁` for silence up through `█` for the loudest level, blue and
-/// brighter for taller bars so the line has some visual "pop" even in a
-/// screenshot, not just a flat color block.
-fn spectrum_line(levels: &[u8]) -> Line<'static> {
-    const CHARS: [char; 8] = ['\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
+/// Renders spectrum bar levels across `spectrum::ROWS` terminal rows — real
+/// vertical resolution (each bar can fill part-way into a row via the
+/// `▁▂▃▄▅▆▇` sub-level glyphs, not just "on or off" per row) rather than the
+/// single flattened row this used to be squeezed into. Rows nearer the top
+/// (i.e. reached only by louder bars) are brighter, like a classic
+/// equalizer's hot/cool gradient recolored into this theme's blues.
+fn spectrum_rows(levels: &[u8]) -> Vec<Line<'static>> {
+    const SUB: [char; 8] = ['\u{0020}', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}'];
+    let rows = spectrum::ROWS;
+
     if levels.is_empty() {
-        return Line::from(Span::styled("(no signal)", theme::muted()));
+        return (0..rows)
+            .map(|r| {
+                if r == rows / 2 {
+                    Line::from(Span::styled("(no signal)", theme::muted()))
+                } else {
+                    Line::default()
+                }
+            })
+            .collect();
     }
-    let spans: Vec<Span<'static>> = levels
-        .iter()
-        .flat_map(|&level| {
-            let idx = (level as usize).min(CHARS.len() - 1);
-            let color = if idx >= 6 {
+
+    (0..rows)
+        .map(|r| {
+            let row_from_bottom = rows - 1 - r;
+            let color = if r < rows / 3 {
                 Color::LightBlue
-            } else if idx >= 3 {
+            } else if r < rows * 2 / 3 {
                 Color::Blue
             } else {
                 Color::DarkGray
             };
-            [
-                Span::styled(CHARS[idx].to_string(), Style::default().fg(color)),
-                Span::raw(" "),
-            ]
+            let spans: Vec<Span<'static>> = levels
+                .iter()
+                .flat_map(|&level| {
+                    let full_rows = level as usize / 8;
+                    let remainder = level as usize % 8;
+                    let ch = if row_from_bottom < full_rows {
+                        '\u{2588}'
+                    } else if row_from_bottom == full_rows {
+                        SUB[remainder]
+                    } else {
+                        ' '
+                    };
+                    [Span::styled(ch.to_string(), Style::default().fg(color)), Span::raw(" ")]
+                })
+                .collect();
+            Line::from(spans)
         })
-        .collect();
-    Line::from(spans)
+        .collect()
 }

@@ -12,6 +12,10 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+// Re-exported so existing `visualizer::BARS`/`visualizer::MAX_LEVEL`
+// references elsewhere in this crate keep working — `maraetai_common::spectrum`
+// is the actual source of truth, shared with the TUI's renderer.
+pub use maraetai_common::spectrum::{BARS, MAX_LEVEL};
 use rodio::Source;
 use rustfft::FftPlanner;
 use rustfft::num_complex::Complex;
@@ -20,11 +24,6 @@ use rustfft::num_complex::Complex;
 /// low-frequency resolution (~43Hz/bin at 44.1kHz) without costing much CPU
 /// on a 250ms tick.
 const FFT_SIZE: usize = 1024;
-/// Number of visualizer bars — matches a comfortable terminal row width.
-pub const BARS: usize = 16;
-/// Bar heights are quantized to 0..=MAX_LEVEL for cheap D-Bus transport and
-/// simple block-character rendering (8 levels: `▁▂▃▄▅▆▇█`).
-pub const MAX_LEVEL: u8 = 7;
 
 const MIN_FREQ_HZ: f32 = 20.0;
 
@@ -104,6 +103,20 @@ impl<S: Source<Item = i16>> Source for VisualizerTap<S> {
     }
     fn total_duration(&self) -> Option<std::time::Duration> {
         self.inner.total_duration()
+    }
+    /// Without this override, `Source::try_seek`'s default (`Err(NotSupported)`)
+    /// wins — the inner decoder can seek fine, but `Sink::try_seek` only ever
+    /// sees the outermost wrapping source, so a tap that doesn't forward the
+    /// call makes every seek silently fail regardless of the decoder underneath.
+    fn try_seek(&mut self, pos: std::time::Duration) -> Result<(), rodio::source::SeekError> {
+        let result = self.inner.try_seek(pos);
+        if result.is_ok() {
+            // Stale samples from before the seek would otherwise linger in
+            // the ring for one tick, briefly showing the spectrum of audio
+            // that's no longer playing.
+            self.ring.clear();
+        }
+        result
     }
 }
 
