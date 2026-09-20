@@ -4,6 +4,7 @@ mod dbus_client;
 mod library;
 mod lifecycle;
 mod login;
+mod update_check;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
