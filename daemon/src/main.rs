@@ -75,6 +75,7 @@ async fn main() -> Result<()> {
             dbus::MPRIS_BUS_NAME_SUFFIX,
             MprisPlayer {
                 playback: playback.clone(),
+                shutdown: Arc::clone(&shutdown),
             },
         )
         .await
@@ -156,6 +157,21 @@ async fn bridge_playback_events_to_mpris(
                     .await
                 {
                     tracing::warn!("failed to emit Seeked signal: {e}");
+                }
+            }
+            Event::RepeatChanged(repeat) => {
+                let status = match repeat {
+                    playback::RepeatMode::Off => mpris_server::LoopStatus::None,
+                    playback::RepeatMode::Track => mpris_server::LoopStatus::Track,
+                    playback::RepeatMode::Queue => mpris_server::LoopStatus::Playlist,
+                };
+                if let Err(e) = server.properties_changed([Property::LoopStatus(status)]).await {
+                    tracing::warn!("failed to emit LoopStatus change: {e}");
+                }
+            }
+            Event::ShuffleChanged(shuffle) => {
+                if let Err(e) = server.properties_changed([Property::Shuffle(shuffle)]).await {
+                    tracing::warn!("failed to emit Shuffle change: {e}");
                 }
             }
             Event::QueueEnded => {
