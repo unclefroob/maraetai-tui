@@ -1,0 +1,19 @@
+pkgbase = maraetai-tui-git
+	pkgdesc = Terminal client for a Navidrome library via maraetai-service, with a background playback daemon (MPRIS/media-key integration)
+	pkgver = r1.0000000
+	pkgrel = 1
+	url = https://github.com/unclefroob/maraetai-tui
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	makedepends = cargo
+	makedepends = git
+	depends = alsa-lib
+	depends = dbus
+	provides = maraetai-tui
+	conflicts = maraetai-tui
+	options = !lto
+	source = maraetai-tui-git::git+https://github.com/unclefroob/maraetai-tui.git
+	sha256sums = SKIP
+
+pkgname = maraetai-tui-git

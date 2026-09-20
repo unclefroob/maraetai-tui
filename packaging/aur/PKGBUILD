@@ -1,0 +1,66 @@
+# Maintainer: Ryan <38415462+unclefroob@users.noreply.github.com>
+#
+# A VCS ("-git") package rather than a versioned one: this project hasn't
+# tagged any releases yet, so tracking master's latest commit — the same
+# convention used by e.g. any other `foo-git` AUR package — is the natural
+# fit. pkgver() below derives a version string from git itself, so this
+# never needs manual bumping when upstream moves.
+#
+# To build+install locally: makepkg -si
+# To (re)generate .SRCINFO before pushing to the AUR: makepkg --printsrcinfo > .SRCINFO
+
+pkgname=maraetai-tui-git
+pkgver=r1.0000000
+pkgrel=1
+pkgdesc="Terminal client for a Navidrome library via maraetai-service, with a background playback daemon (MPRIS/media-key integration)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/unclefroob/maraetai-tui"
+license=('MIT')
+depends=('alsa-lib' 'dbus')
+makedepends=('cargo' 'git')
+# Arch's default makepkg.conf has `lto` in OPTIONS, which auto-appends
+# -flto to CFLAGS/CXXFLAGS. That breaks the `ring` crate (a dependency of
+# reqwest's rustls-tls backend): its build script compiles hand-written C
+# with $CFLAGS, and GCC's LTO mode emits bytecode-only objects that
+# rust-lld (used to link the final Rust binary) can't read — every symbol
+# from ring's C code then fails to link as "undefined". Rust code itself
+# is compiled by rustc, not affected by CFLAGS either way, so there's no
+# LTO benefit being given up here.
+options=('!lto')
+provides=('maraetai-tui')
+conflicts=('maraetai-tui')
+source=("$pkgname::git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd "$pkgname"
+    printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short=12 HEAD)"
+}
+
+prepare() {
+    cd "$pkgname"
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+}
+
+build() {
+    cd "$pkgname"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo build --frozen --release --workspace
+}
+
+check() {
+    cd "$pkgname"
+    export RUSTUP_TOOLCHAIN=stable
+    # Fully self-contained (mock HTTP servers on 127.0.0.1, no real audio
+    # device or network needed) — safe in a sandboxed build.
+    cargo test --frozen --workspace
+}
+
+package() {
+    cd "$pkgname"
+    install -Dm755 "target/release/maraetai" "$pkgdir/usr/bin/maraetai"
+    install -Dm755 "target/release/maraetaid" "$pkgdir/usr/bin/maraetaid"
+    install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 "README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+}
