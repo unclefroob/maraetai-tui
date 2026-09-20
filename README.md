@@ -59,13 +59,56 @@ is stored in the OS keyring (`keyring` crate — Secret Service/KWallet on
 Linux), never on disk — the one thing every *other* maraetai client (except
 iOS's Keychain use) doesn't already do.
 
-## Setup
+## Installation
+
+### From source
 
 ```sh
-cargo build --workspace
-./target/debug/maraetai login       # prompts for server URL, username, password
-./target/debug/maraetai             # launches the TUI: browse albums, / to search,
-                                     # Enter to play, auto-spawning maraetaid
+cargo build --workspace --release
+sudo install -Dm755 target/release/maraetai  /usr/local/bin/maraetai
+sudo install -Dm755 target/release/maraetaid /usr/local/bin/maraetaid
+```
+
+Or skip the `install` step and just run the binaries straight out of
+`target/release/` (or `target/debug/` for a `cargo build --workspace`
+without `--release`) — see [Usage](#usage) below either way.
+
+### AUR (Arch Linux) — coming soon
+
+A `maraetai-tui-git` package (tracking `master`'s latest commit, since
+there are no tagged releases) is packaged in `packaging/aur/` and builds
+cleanly with `makepkg`, but isn't published to the AUR yet — that needs an
+AUR account, which hasn't been set up. Once it's live:
+
+```sh
+paru -S maraetai-tui-git   # or: yay -S maraetai-tui-git
+```
+
+or manually:
+
+```sh
+git clone https://aur.archlinux.org/maraetai-tui-git.git
+cd maraetai-tui-git
+makepkg -si
+```
+
+### Fedora / COPR — coming soon
+
+A spec file is packaged in `packaging/rpm/` for a COPR repo (Fedora's
+community package repo), but isn't published yet — that needs a Fedora
+account, which hasn't been set up. Once it's live:
+
+```sh
+sudo dnf copr enable unclefroob/maraetai-tui
+sudo dnf install maraetai-tui
+```
+
+## Usage
+
+```sh
+maraetai login       # prompts for server URL, username, password
+maraetai             # launches the TUI: browse albums, / to search,
+                      # Enter to play, auto-spawning maraetaid
 ```
 
 In the TUI: arrow keys/`j`/`k` to move, `Enter` to open a list or play from
