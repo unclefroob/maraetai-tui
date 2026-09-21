@@ -631,6 +631,15 @@ fn home_move_selection(sections: &[HomeSection], section: &mut usize, selected: 
     (*section, *selected) = flat[next];
 }
 
+/// Keeps a selected row roughly centred while a list is long enough to
+/// scroll. Ratatui otherwise starts a new state at offset zero each redraw
+/// and moves the viewport only far enough to make the selection visible,
+/// which pins it to the last visible line during downward navigation.
+fn scroll_offset(selected: usize, len: usize, viewport_rows: usize) -> usize {
+    let max_offset = len.saturating_sub(viewport_rows);
+    selected.saturating_sub(viewport_rows / 2).min(max_offset)
+}
+
 fn filter_hint_title(base: &str, filter: &str, editing: bool, hint: &str) -> String {
     if editing {
         format!(" {base} — filter: {filter}_  [Enter] apply  [Esc] cancel ")
@@ -2350,7 +2359,9 @@ impl App<'_> {
         let items: Vec<ListItem> = items.map(ListItem::new).collect();
         let len = items.len();
         let list = List::new(items).block(rounded_block(title.to_string())).highlight_style(theme::selected());
-        let mut state = ListState::default();
+        let viewport_rows = area.height.saturating_sub(2) as usize;
+        let mut state =
+            ListState::default().with_offset(scroll_offset(selected, len, viewport_rows));
         if len > 0 {
             state.select(Some(selected));
         }
@@ -2413,7 +2424,11 @@ impl App<'_> {
             .block(rounded_block(title.to_string()))
             .highlight_style(theme::selected());
 
-        let mut state = TableState::default();
+        // A table has its border plus its column header, leaving three fewer
+        // terminal rows for selectable tracks.
+        let viewport_rows = area.height.saturating_sub(3) as usize;
+        let mut state =
+            TableState::default().with_offset(scroll_offset(selected, len, viewport_rows));
         if len > 0 {
             state.select(Some(selected));
         }
@@ -2869,6 +2884,13 @@ mod tests {
             .zip(kinds)
             .map(|(&n, kind)| HomeSection { kind, items: HomeItems::Songs((0..n).map(|i| test_song(&i.to_string())).collect()) })
             .collect()
+    }
+
+    #[test]
+    fn scroll_offset_centres_the_selection_until_the_end_of_a_list() {
+        assert_eq!(scroll_offset(0, 100, 10), 0);
+        assert_eq!(scroll_offset(20, 100, 10), 15);
+        assert_eq!(scroll_offset(99, 100, 10), 90);
     }
 
     #[test]
