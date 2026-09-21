@@ -58,7 +58,7 @@ const LYRICS_PANEL_HEIGHT: u16 = 9;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     /// A dashboard of short previews from all four maraetai-service-native
-    /// lists (Favourites, Recently Played, On Repeat, Songs For You) — see
+    /// lists (Favourites, Recently Added, On Repeat, Songs For You) — see
     /// `Screen::Home`. Replaces giving each of those its own top-level tab,
     /// which had grown past what digits `1`-`9` could reach directly.
     Home,
@@ -163,7 +163,7 @@ const HOME_PREVIEW_ROWS: usize = 5;
 #[derive(Clone, Copy)]
 enum NativeKind {
     Favourites,
-    RecentlyPlayed,
+    RecentlyAdded,
     OnRepeat,
     SongsForYou,
 }
@@ -172,18 +172,48 @@ impl NativeKind {
     fn title(self) -> &'static str {
         match self {
             NativeKind::Favourites => "Favourites",
-            NativeKind::RecentlyPlayed => "Recently Played",
+            NativeKind::RecentlyAdded => "Recently Added",
             NativeKind::OnRepeat => "On Repeat",
             NativeKind::SongsForYou => "Songs For You",
         }
     }
 }
 
-/// One section of `Screen::Home` — a native list's title plus a capped
-/// preview (`HOME_PREVIEW_ROWS`) of its songs.
+/// One Home section can be song-shaped (the service's personal lists) or
+/// album-shaped (the standard Subsonic newest-albums endpoint).
+#[derive(Clone)]
+enum HomeItems {
+    Songs(Vec<Song>),
+    Albums(Vec<Album>),
+}
+
+/// One section of `Screen::Home` — a title plus a capped preview.
 struct HomeSection {
     kind: NativeKind,
-    songs: Vec<Song>,
+    items: HomeItems,
+}
+
+impl HomeSection {
+    fn len(&self) -> usize {
+        match &self.items {
+            HomeItems::Songs(songs) => songs.len(),
+            HomeItems::Albums(albums) => albums.len(),
+        }
+    }
+
+    fn songs(&self) -> Option<&[Song]> {
+        match &self.items {
+            HomeItems::Songs(songs) => Some(songs),
+            HomeItems::Albums(_) => None,
+        }
+    }
+
+    fn songs_mut(&mut self) -> Option<&mut Vec<Song>> {
+        match &mut self.items {
+            HomeItems::Songs(songs) => Some(songs),
+            HomeItems::Albums(_) => None,
+        }
+    }
 }
 
 /// Which `getAlbumList2` ordering the top-level Albums tab is showing —
@@ -277,7 +307,7 @@ enum Screen {
     },
     /// The Home dashboard — short previews of all four native lists.
     /// `section`/`selected` together are the cursor: `selected` is a row
-    /// within `sections[section].songs`. Moving up past row 0 or down past
+    /// within `sections[section]`. Moving up past row 0 or down past
     /// the last row crosses into the adjacent section (skipping any that
     /// are empty) rather than wrapping within one section, so it reads as
     /// one continuous scroll through the whole dashboard.
@@ -586,13 +616,13 @@ fn apply_filter_key(filter: &mut String, selected: &mut usize, code: KeyCode) ->
 }
 
 /// Moves `Screen::Home`'s cursor by `delta` rows, treating every non-empty
-/// section's songs as one continuous, wrapping scroll — so a section with
+/// section's rows as one continuous, wrapping scroll — so a section with
 /// nothing in it (e.g. no favourites yet) is skipped over entirely rather
 /// than getting "stuck" with nowhere to move, and moving past the top/
 /// bottom of one section naturally lands in the next.
 fn home_move_selection(sections: &[HomeSection], section: &mut usize, selected: &mut usize, delta: i32) {
     let flat: Vec<(usize, usize)> =
-        sections.iter().enumerate().flat_map(|(si, s)| (0..s.songs.len()).map(move |ri| (si, ri))).collect();
+        sections.iter().enumerate().flat_map(|(si, s)| (0..s.len()).map(move |ri| (si, ri))).collect();
     if flat.is_empty() {
         return;
     }
@@ -1074,35 +1104,32 @@ impl App<'_> {
                     .unwrap_or_default();
                 self.stack.push(Screen::GenreList { genres, selected: 0, filter: String::new() });
             }
-            // A dashboard of short previews from all four
-            // maraetai-service-native list endpoints, fetched concurrently
-            // since they're independent — see `Screen::Home`. Each
-            // endpoint's own failure (e.g. an older maraetai-service
-            // without On Repeat) only empties that one section rather than
-            // failing the whole tab.
+            // A dashboard of short previews, fetched concurrently. The
+            // Recently Added section uses Subsonic's standard newest-albums
+            // ordering; the other sections are maraetai-service song lists.
             Tab::Home => {
                 self.message = "Loading home…".to_string();
                 let _ = terminal.draw(|f| self.draw_message(f));
-                let (favourites, recently_played, on_repeat, songs_for_you) = tokio::join!(
+                let (favourites, recently_added, on_repeat, songs_for_you) = tokio::join!(
                     self.library.favourites(),
-                    self.library.recently_played(),
+                    self.library.newest_albums(),
                     self.library.on_repeat(),
                     self.library.songs_for_you(),
                 );
                 self.message.clear();
-                let sections = [
-                    (NativeKind::Favourites, favourites),
-                    (NativeKind::RecentlyPlayed, recently_played),
-                    (NativeKind::OnRepeat, on_repeat),
-                    (NativeKind::SongsForYou, songs_for_you),
-                ]
-                .into_iter()
-                .map(|(kind, result)| {
+                let song_section = |kind, result: anyhow::Result<Vec<Song>>| {
                     let mut songs = result.unwrap_or_default();
                     songs.truncate(HOME_PREVIEW_ROWS);
-                    HomeSection { kind, songs }
-                })
-                .collect();
+                    HomeSection { kind, items: HomeItems::Songs(songs) }
+                };
+                let mut albums = recently_added.unwrap_or_default();
+                albums.truncate(HOME_PREVIEW_ROWS);
+                let sections = vec![
+                    song_section(NativeKind::Favourites, favourites),
+                    HomeSection { kind: NativeKind::RecentlyAdded, items: HomeItems::Albums(albums) },
+                    song_section(NativeKind::OnRepeat, on_repeat),
+                    song_section(NativeKind::SongsForYou, songs_for_you),
+                ];
                 self.stack.push(Screen::Home { sections, section: 0, selected: 0 });
             }
             Tab::Search => {
@@ -1136,10 +1163,6 @@ impl App<'_> {
         }
     }
 
-    /// Shared loader for the four maraetai-service-native tabs (Favourites,
-    /// Recently Played, On Repeat, Songs For You) — each is just a
-    /// differently-sourced song list, so this always lands on the same
-    /// `Screen::SongList` the regular browsing screens use.
     #[allow(clippy::type_complexity)]
     /// Pushes a full `Screen::SongList` for one of maraetai-service's
     /// native list endpoints — used to "expand" a `Screen::Home` section
@@ -1396,15 +1419,20 @@ impl App<'_> {
             }
             return;
         }
-        // Plays from within the section's capped preview only — "the rest
-        // of this section's 5 shown songs", not the full underlying list
-        // (which isn't loaded here at all); `e` expands to the full list
-        // first if that continuation matters.
+        // Song sections play from their capped preview. Recently Added is
+        // album-shaped, so Enter opens the selected album's track list.
         if let Screen::Home { sections, section, selected } = self.top() {
-            if let Some(songs) = sections.get(*section).map(|s| s.songs.clone()) {
-                if !songs.is_empty() {
-                    self.play_from(songs, *selected).await;
+            let item = sections.get(*section).map(|s| (s.items.clone(), *selected));
+            match item {
+                Some((HomeItems::Songs(songs), selected)) if !songs.is_empty() => self.play_from(songs, selected).await,
+                Some((HomeItems::Albums(albums), selected)) => {
+                    let Some(album) = albums.get(selected).cloned() else { return };
+                    self.push_song_list(terminal, album.name.clone(), None, |c| {
+                        let id = album.id.clone();
+                        Box::pin(async move { c.album_songs(&id).await })
+                    }).await;
                 }
+                _ => {}
             }
             return;
         }
@@ -1504,9 +1532,8 @@ impl App<'_> {
     /// replacing it — the only screens where "append instead of replace"
     /// means anything are the song-shaped ones.
     /// `e`: expands the currently-focused Home section past its capped
-    /// preview, pushing a full `Screen::SongList` for it (the same screen
-    /// the old dedicated tabs used to land on) via the matching native
-    /// endpoint. A no-op anywhere but Home.
+    /// preview. Song sections open `Screen::SongList`; Recently Added opens
+    /// the full newest-albums list. A no-op anywhere but Home.
     async fn expand_home_section(&mut self, terminal: &mut ratatui::DefaultTerminal) {
         let Screen::Home { sections, section, .. } = self.top() else { return };
         let Some(kind) = sections.get(*section).map(|s| s.kind) else { return };
@@ -1515,11 +1542,8 @@ impl App<'_> {
                 self.push_native_song_list(terminal, kind.title(), |c| Box::pin(async move { c.favourites().await }))
                     .await;
             }
-            NativeKind::RecentlyPlayed => {
-                self.push_native_song_list(terminal, kind.title(), |c| {
-                    Box::pin(async move { c.recently_played().await })
-                })
-                .await;
+            NativeKind::RecentlyAdded => {
+                self.push_album_list(terminal, kind.title().to_string(), |c| Box::pin(async move { c.newest_albums().await })).await;
             }
             NativeKind::OnRepeat => {
                 self.push_native_song_list(terminal, kind.title(), |c| Box::pin(async move { c.on_repeat().await }))
@@ -1565,7 +1589,7 @@ impl App<'_> {
         let visible = self.visible_indices();
         match self.top() {
             Screen::Home { sections, selected, .. } => {
-                sections.get(home_section?)?.songs.get(*selected).map(|s| s.id.clone())
+                sections.get(home_section?)?.songs()?.get(*selected).map(|s| s.id.clone())
             }
             Screen::SongList { songs, selected, .. } => {
                 visible.get(*selected).and_then(|&i| songs.get(i)).map(|s| s.id.clone())
@@ -1872,7 +1896,7 @@ impl App<'_> {
             return;
         }
         if let Screen::Home { sections, section, selected } = self.top() {
-            let song = sections.get(*section).and_then(|s| s.songs.get(*selected)).cloned();
+            let song = sections.get(*section).and_then(|s| s.songs()).and_then(|songs| songs.get(*selected)).cloned();
             if let Some(song) = song {
                 self.play_next(vec![song]).await;
             }
@@ -1908,7 +1932,7 @@ impl App<'_> {
         // Home's `selected` already indexes directly into its (unfiltered,
         // capped-preview) section, unlike the other screens below.
         if let Screen::Home { sections, section, selected } = self.top() {
-            if let Some(songs) = sections.get(*section).map(|s| s.songs.clone()) {
+            if let Some(songs) = sections.get(*section).and_then(|s| s.songs()).map(ToOwned::to_owned) {
                 if !songs.is_empty() {
                     self.append_from(songs, *selected).await;
                 }
@@ -1948,7 +1972,7 @@ impl App<'_> {
         let visible = self.visible_indices();
         let song = match self.stack.last_mut() {
             Some(Screen::Home { sections, selected, .. }) => {
-                sections.get_mut(home_section.expect("only set when top() is Home")).and_then(|s| s.songs.get_mut(*selected))
+                sections.get_mut(home_section.expect("only set when top() is Home")).and_then(HomeSection::songs_mut).and_then(|songs| songs.get_mut(*selected))
             }
             Some(Screen::SongList { songs, selected, .. }) => visible.get(*selected).and_then(|&i| songs.get_mut(i)),
             Some(Screen::Search { results, selected, editing, .. }) if !*editing => {
@@ -1966,7 +1990,7 @@ impl App<'_> {
                 // if the list was mutated in between (it isn't, here, but
                 // this way that's not an invariant this code has to keep).
                 let target = match self.stack.last_mut() {
-                    Some(Screen::Home { sections, .. }) => sections.iter_mut().flat_map(|s| &mut s.songs).find(|s| s.id == id),
+                    Some(Screen::Home { sections, .. }) => sections.iter_mut().filter_map(HomeSection::songs_mut).flatten().find(|s| s.id == id),
                     Some(Screen::SongList { songs, .. }) => songs.iter_mut().find(|s| s.id == id),
                     Some(Screen::Search { results, .. }) => results.iter_mut().find(|s| s.id == id),
                     _ => None,
@@ -2419,7 +2443,7 @@ impl App<'_> {
 
     /// The Home dashboard: one compact section per native list, stacked in
     /// equal-height quarters. Rendered with plain `List`s (not the full
-    /// song-table machinery) since previews are short and simple — only the
+    /// table machinery) since previews are short and simple — only the
     /// row under `Screen::Home`'s cursor is ever highlighted, in whichever
     /// section currently has focus, so it's clear there's one cursor moving
     /// through the whole dashboard rather than four independent lists.
@@ -2430,31 +2454,29 @@ impl App<'_> {
 
         for (i, sec) in sections.iter().enumerate() {
             let focused = i == section;
-            let title = format!(" {} — [Enter] play  [e]xpand  [a]dd  [A] next  [f]avorite ", sec.kind.title());
-            if sec.songs.is_empty() {
+            let title = match &sec.items {
+                HomeItems::Songs(_) => format!(" {} — [Enter] play  [e]xpand  [a]dd  [A] next  [f]avorite ", sec.kind.title()),
+                HomeItems::Albums(_) => format!(" {} — [Enter] open  [e]xpand ", sec.kind.title()),
+            };
+            if sec.len() == 0 {
                 let block = rounded_block(title);
                 let inner = block.inner(chunks[i]);
                 frame.render_widget(block, chunks[i]);
                 frame.render_widget(Paragraph::new(Span::styled("(nothing here yet)", theme::muted())), inner);
                 continue;
             }
-            let items: Vec<ListItem> = sec
-                .songs
-                .iter()
-                .enumerate()
-                .map(|(row, s)| {
+            let items: Vec<ListItem> = match &sec.items {
+                HomeItems::Songs(songs) => songs.iter().enumerate().map(|(row, s)| {
                     let text = format!("{}  —  {}", s.title, s.artist);
                     let text = if s.is_starred() { format!("\u{2605} {text}") } else { text };
-                    let style = if focused && row == selected {
-                        theme::selected()
-                    } else if s.is_starred() {
-                        theme::state_tag()
-                    } else {
-                        Style::default()
-                    };
+                    let style = if focused && row == selected { theme::selected() } else if s.is_starred() { theme::state_tag() } else { Style::default() };
                     ListItem::new(text).style(style)
-                })
-                .collect();
+                }).collect(),
+                HomeItems::Albums(albums) => albums.iter().enumerate().map(|(row, album)| {
+                    let style = if focused && row == selected { theme::selected() } else { Style::default() };
+                    ListItem::new(format!("{}  —  {}", album.name, album.artist)).style(style)
+                }).collect(),
+            };
             frame.render_widget(List::new(items).block(rounded_block(title)), chunks[i]);
         }
     }
@@ -2841,11 +2863,11 @@ mod tests {
     }
 
     fn test_sections(counts: &[usize]) -> Vec<HomeSection> {
-        let kinds = [NativeKind::Favourites, NativeKind::RecentlyPlayed, NativeKind::OnRepeat, NativeKind::SongsForYou];
+        let kinds = [NativeKind::Favourites, NativeKind::RecentlyAdded, NativeKind::OnRepeat, NativeKind::SongsForYou];
         counts
             .iter()
             .zip(kinds)
-            .map(|(&n, kind)| HomeSection { kind, songs: (0..n).map(|i| test_song(&i.to_string())).collect() })
+            .map(|(&n, kind)| HomeSection { kind, items: HomeItems::Songs((0..n).map(|i| test_song(&i.to_string())).collect()) })
             .collect()
     }
 
