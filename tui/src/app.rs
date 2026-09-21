@@ -119,6 +119,12 @@ mod theme {
     pub fn muted() -> Style {
         Style::default().fg(Color::DarkGray)
     }
+    /// Bottom-row controls need to be legible at a glance, unlike secondary
+    /// metadata elsewhere in the interface; DarkGray disappears on many
+    /// terminal backgrounds.
+    pub fn control_hint() -> Style {
+        Style::default().fg(Color::LightBlue)
+    }
     pub fn border() -> Style {
         Style::default().fg(Color::Blue)
     }
@@ -2759,12 +2765,12 @@ impl App<'_> {
             state_spans.push(Span::raw(" "));
             state_spans.push(Span::styled("[shuffle]", theme::accent()));
         }
-        let muted_from = state_spans.len();
+        let hint_from = state_spans.len();
         state_spans.push(Span::raw("  "));
         state_spans.push(Span::raw(volume_slider(now_playing.volume)));
         state_spans.push(Span::raw("   [space] play/pause  [\u{2190}/\u{2192}] seek  [n]ext [p]rev  [s]top  [?] help"));
-        for span in &mut state_spans[muted_from..] {
-            span.style = theme::muted().patch(span.style);
+        for span in &mut state_spans[hint_from..] {
+            span.style = theme::control_hint().patch(span.style);
         }
         frame.render_widget(Paragraph::new(Line::from(state_spans)), sections[1]);
     }
